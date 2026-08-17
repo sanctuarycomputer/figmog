@@ -1,0 +1,53 @@
+{
+  "status": 200,
+  "error": false,
+  "meta": {
+    "variables": {
+      "VariableID:100": {
+        "id": "VariableID:100",
+        "name": "color/surface/primary",
+        "resolvedType": "COLOR",
+        "variableCollectionId": "VariableCollectionId:1",
+        "valuesByMode": {
+          "1:0": { "r": 0.06, "g": 0.13, "b": 0.2, "a": 1.0 },
+          "1:1": { "type": "VARIABLE_ALIAS", "id": "VariableID:101" }
+        },
+        "description": "primary surface",
+        "scopes": ["FRAME_FILL", "SHAPE_FILL"]
+      },
+      "VariableID:101": {
+        "id": "VariableID:101",
+        "name": "color/base/ink",
+        "resolvedType": "COLOR",
+        "variableCollectionId": "VariableCollectionId:1",
+        "valuesByMode": { "1:0": { "r": 0.9, "g": 0.9, "b": 0.9, "a": 1.0 },
+                           "1:1": { "r": 0.1, "g": 0.1, "b": 0.1, "a": 1.0 } },
+        "description": "",
+        "scopes": ["ALL_SCOPES"]
+      },
+      "VariableID:200": {
+        "id": "VariableID:200",
+        "name": "space/md",
+        "resolvedType": "FLOAT",
+        "variableCollectionId": "VariableCollectionId:2",
+        "valuesByMode": { "2:0": 16.0 },
+        "description": "",
+        "scopes": ["GAP"]
+      }
+    },
+    "variableCollections": {
+      "VariableCollectionId:1": {
+        "id": "VariableCollectionId:1",
+        "name": "colors",
+        "modes": [ {"modeId": "1:0", "name": "light"}, {"modeId": "1:1", "name": "dark"} ],
+        "defaultModeId": "1:0"
+      },
+      "VariableCollectionId:2": {
+        "id": "VariableCollectionId:2",
+        "name": "spacing",
+        "modes": [ {"modeId": "2:0", "name": "default"} ],
+        "defaultModeId": "2:0"
+      }
+    }
+  }
+}
