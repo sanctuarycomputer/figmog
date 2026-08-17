@@ -1,3 +1,5 @@
 target/
 .figmog/
+# Per-worktree SDD planning/ledger state (task briefs, reports, review
+# diffs) — working scaffolding for this migration, not part of the repo.
 .superpowers/
