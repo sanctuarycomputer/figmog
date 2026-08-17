@@ -38,6 +38,10 @@ $ chmod +x figmog
 $ ./figmog --help
 ```
 
+**Linux: glibc requirement.** The `x86_64-unknown-linux-gnu` binary is
+built on Ubuntu 24.04 and requires glibc ≥ 2.39; on older distros, build
+from source instead (see below).
+
 **macOS: unsigned binary.** These builds are not code-signed or notarized
 (no Apple Developer account in the loop yet), so Gatekeeper will refuse
 to run the downloaded binary until you clear the quarantine attribute

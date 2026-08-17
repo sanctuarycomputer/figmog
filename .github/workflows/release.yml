@@ -17,6 +17,8 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
@@ -26,20 +28,20 @@ jobs:
           rustup target add ${{ matrix.target }}
 
       - name: cargo build --release
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Strip binary
         run: strip target/${{ matrix.target }}/release/figmog
 
       - name: Package tarball
         run: |
-          tar czf figmog-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz \
+          tar czf "figmog-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz" \
             -C target/${{ matrix.target }}/release figmog
 
       - uses: actions/upload-artifact@v4
         with:
           name: figmog-${{ matrix.target }}
-          path: figmog-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          path: "figmog-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"
           if-no-files-found: error
 
   publish:
