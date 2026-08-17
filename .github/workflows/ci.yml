@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main, first-pass-2]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        run: |
+          rustup default stable
+          rustup component add rustfmt clippy
+
+      - name: Cache cargo registry, git, and build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: cargo test
+        run: cargo test
+
+      - name: cargo clippy
+        run: cargo clippy --no-deps --all-targets -- -D warnings
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
