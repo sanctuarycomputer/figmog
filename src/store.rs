@@ -65,18 +65,15 @@ pub fn style_edges(d: &Keyed<String, NodeRec>) -> Vec<Keyed<String, String>> {
 /// somewhere on it (one edge per distinct variable, even if bound at
 /// multiple property paths).
 pub fn variable_edges(d: &Keyed<String, NodeRec>) -> Vec<Keyed<String, String>> {
-    let mut edges: Vec<_> = d
-        .val
+    // No dedup here: `bound_variables` can bind the same variable at
+    // multiple property paths, producing duplicate (node id, var id) edges.
+    // We don't sort/dedup them because `InvertedIndex` is set-semantic —
+    // duplicate edges collapse to the same membership and are harmless.
+    d.val
         .bound_variables
         .iter()
         .map(|(_, var_id)| Keyed::new(d.val.id.clone(), var_id.clone()))
-        .collect();
-    // Best-effort adjacent dedup only: `bound_variables` is sorted by
-    // (pointer, var_id), not by var_id, so equal ids at different pointers
-    // aren't caught here. Harmless — `InvertedIndex` is set-semantic, so
-    // any duplicate edges that slip through are absorbed.
-    edges.dedup_by(|a, b| a.val == b.val);
-    edges
+        .collect()
 }
 
 /// Feeds the `by_type` inverted index: node id -> its Figma node type.

@@ -346,7 +346,7 @@ fn proxy_cache_survives_same_version_and_is_evicted_on_version_change() {
     let tool = "get_code";
     let args = "{\"nodeId\":\"1:2\"}";
     let content = serde_json::json!({"content": [{"type": "text", "text": "<div/>"}]});
-    figmog::cache::store(&mut st, tool, args, "100", &content);
+    figmog::cache::store(&mut st, tool, args, "100", &content).unwrap();
 
     // Cache row present right after the write.
     st.rtx(|(_, _, _, _, _, _, _, cache)| {

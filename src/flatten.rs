@@ -46,46 +46,50 @@ pub fn flatten_file(resp: &Value) -> Result<Flattened, FlattenError> {
     let mut recs = Vec::new();
     walk(document, None, 0, None, &mut recs);
 
-    let obj_map = |key: &str| -> BTreeMap<String, Value> {
+    // Borrowed, not cloned: every entry is read once here (a handful of
+    // `str_field`/`get` lookups) and dropped, so there's no reason to clone
+    // each envelope `Value` just to iterate it. `BTreeMap` keeps the same
+    // deterministic (sorted-by-id) iteration order as before.
+    let obj_map = |key: &str| -> BTreeMap<&str, &Value> {
         resp.get(key)
             .and_then(Value::as_object)
-            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .map(|m| m.iter().map(|(k, v)| (k.as_str(), v)).collect())
             .unwrap_or_default()
     };
     for (node_id, v) in obj_map("components") {
         recs.push((
-            Id::Component(node_id.clone()),
+            Id::Component(node_id.to_string()),
             Rec::Component(ComponentRec {
-                node_id,
-                key: str_field(&v, "key").unwrap_or_default(),
-                name: str_field(&v, "name").unwrap_or_default(),
-                description: str_field(&v, "description").unwrap_or_default(),
-                component_set_id: str_field(&v, "componentSetId"),
+                node_id: node_id.to_string(),
+                key: str_field(v, "key").unwrap_or_default(),
+                name: str_field(v, "name").unwrap_or_default(),
+                description: str_field(v, "description").unwrap_or_default(),
+                component_set_id: str_field(v, "componentSetId"),
                 remote: v.get("remote").and_then(Value::as_bool).unwrap_or(false),
             }),
         ));
     }
     for (node_id, v) in obj_map("componentSets") {
         recs.push((
-            Id::ComponentSet(node_id.clone()),
+            Id::ComponentSet(node_id.to_string()),
             Rec::ComponentSet(ComponentSetRec {
-                node_id,
-                key: str_field(&v, "key").unwrap_or_default(),
-                name: str_field(&v, "name").unwrap_or_default(),
-                description: str_field(&v, "description").unwrap_or_default(),
+                node_id: node_id.to_string(),
+                key: str_field(v, "key").unwrap_or_default(),
+                name: str_field(v, "name").unwrap_or_default(),
+                description: str_field(v, "description").unwrap_or_default(),
                 remote: v.get("remote").and_then(Value::as_bool).unwrap_or(false),
             }),
         ));
     }
     for (style_id, v) in obj_map("styles") {
         recs.push((
-            Id::Style(style_id.clone()),
+            Id::Style(style_id.to_string()),
             Rec::Style(StyleRec {
-                style_id,
-                key: str_field(&v, "key").unwrap_or_default(),
-                name: str_field(&v, "name").unwrap_or_default(),
-                style_type: str_field(&v, "styleType").unwrap_or_default(),
-                description: str_field(&v, "description").unwrap_or_default(),
+                style_id: style_id.to_string(),
+                key: str_field(v, "key").unwrap_or_default(),
+                name: str_field(v, "name").unwrap_or_default(),
+                style_type: str_field(v, "styleType").unwrap_or_default(),
+                description: str_field(v, "description").unwrap_or_default(),
                 remote: v.get("remote").and_then(Value::as_bool).unwrap_or(false),
             }),
         ));

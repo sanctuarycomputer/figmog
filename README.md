@@ -130,6 +130,13 @@ if none were.
 $ claude mcp add figmog -- /absolute/path/to/clog/target/debug/figmog serve
 ```
 
+With more than one mirrored file, the poll loop round-robins: each tick
+polls one session's Tier-3 meta endpoint, and the wait between ticks is
+`--interval` split evenly across the mirrored files, floored at 2s — so
+with many files the loop still tops out at 30 Tier-3 requests/min (well
+under the ~50 req/min Starter cap above), it just polls each individual
+file less often as the file count grows.
+
 Zero files at startup is valid and needs no `FIGMA_TOKEN` up front — the
 server starts empty and mirrors files as an agent references them by URL.
 This is the shape to reach for with `claude mcp add` when you don't want

@@ -60,25 +60,31 @@ pub fn lookup<R: Readable>(
 }
 
 /// Store (upsert) a response under its cache key, tagged with the file
-/// version it was fetched at.
+/// version it was fetched at. Fails if `content` can't be serialized —
+/// callers propagate that as the tool call's error (`isError`) rather than
+/// silently caching an empty string that `lookup` would later fail to
+/// deserialize on the read side instead.
 pub fn store<P: Push<Keyed<Id, Rec>>>(
     st: &mut KeyedStream<Id, Rec, P>,
     tool: &str,
     args_canonical: &str,
     file_version: &str,
     content: &Value,
-) {
+) -> Result<(), String> {
     let key = cache_key(tool, args_canonical);
+    let content = serde_json::to_string(content)
+        .map_err(|e| format!("failed to serialize {tool} response for caching: {e}"))?;
     let rec = ProxyCacheRec {
         key_hash: key.clone(),
         tool: tool.to_string(),
         args_canonical: args_canonical.to_string(),
         file_version: file_version.to_string(),
-        content: serde_json::to_string(content).unwrap_or_default(),
+        content,
     };
     st.wtx(|tx| {
         tx.upsert(&Id::ProxyCache(key.clone()), &Rec::ProxyCache(rec.clone()));
     });
+    Ok(())
 }
 
 #[cfg(test)]

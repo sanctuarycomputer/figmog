@@ -20,4 +20,4 @@ assert_cmd = "2"
 postcard = { version = "1", features = ["use-std"] }
 
 [profile.dev]
-opt-level = 3
+opt-level = 3 # required for reasonable fold/anny perf

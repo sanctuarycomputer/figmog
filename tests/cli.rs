@@ -475,7 +475,8 @@ fn cli_pull_evicts_stale_cache_rows_on_version_change() {
             "{}",
             "100",
             &serde_json::json!({"cached": true}),
-        );
+        )
+        .unwrap();
         let hit = st.rtx(|(_, _, _, _, _, _, _, cache_reader)| {
             cache::lookup(&cache_reader, "get_code", "{}", "100")
         });

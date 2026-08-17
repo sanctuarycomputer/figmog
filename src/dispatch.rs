@@ -56,8 +56,33 @@ pub(crate) fn arg_str(args: &Value, key: &str) -> Option<String> {
     args.get(key).and_then(Value::as_str).map(str::to_string)
 }
 
+/// JSON type name for an error message — `Value`'s own variant names
+/// ("Number", "String", ...) aren't what a caller expects to read, so this
+/// spells out the JSON vocabulary instead (`"number"`, `"string"`, ...).
+fn json_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+/// A required field that's present but the wrong JSON type is a different,
+/// more actionable error than an absent one — `"expected string for `id`,
+/// got number"` tells the caller what to fix; `"missing required field"`
+/// would send them looking for a key that's actually right there.
 pub(crate) fn require_str(args: &Value, key: &str) -> Result<String, String> {
-    arg_str(args, key).ok_or_else(|| format!("missing required field: {key}"))
+    match args.get(key) {
+        None => Err(format!("missing required field: {key}")),
+        Some(Value::String(s)) => Ok(s.clone()),
+        Some(other) => Err(format!(
+            "expected string for `{key}`, got {}",
+            json_type_name(other)
+        )),
+    }
 }
 
 pub(crate) fn arg_usize(args: &Value, key: &str) -> Option<usize> {
@@ -68,10 +93,15 @@ pub(crate) fn arg_bool(args: &Value, key: &str) -> bool {
     args.get(key).and_then(Value::as_bool).unwrap_or(false)
 }
 
+/// See [`require_str`]'s doc comment — same present-but-wrong-type
+/// distinction, for numeric fields.
 pub(crate) fn require_f64(args: &Value, key: &str) -> Result<f64, String> {
-    args.get(key)
-        .and_then(Value::as_f64)
-        .ok_or_else(|| format!("missing required field: {key}"))
+    match args.get(key) {
+        None => Err(format!("missing required field: {key}")),
+        Some(v) => v
+            .as_f64()
+            .ok_or_else(|| format!("expected number for `{key}`, got {}", json_type_name(v))),
+    }
 }
 
 /// Dispatch one of the 16 read-only `figmog_*` tools against an open
@@ -383,4 +413,33 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
     });
 
     tools
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn require_str_reports_wrong_type_not_missing() {
+        let err = require_str(&json!({"id": 12}), "id").unwrap_err();
+        assert_eq!(err, "expected string for `id`, got number");
+    }
+
+    #[test]
+    fn require_str_reports_missing_when_key_absent() {
+        let err = require_str(&json!({}), "id").unwrap_err();
+        assert_eq!(err, "missing required field: id");
+    }
+
+    #[test]
+    fn require_f64_reports_wrong_type_not_missing() {
+        let err = require_f64(&json!({"x": "12"}), "x").unwrap_err();
+        assert_eq!(err, "expected number for `x`, got string");
+    }
+
+    #[test]
+    fn require_f64_reports_missing_when_key_absent() {
+        let err = require_f64(&json!({}), "x").unwrap_err();
+        assert_eq!(err, "missing required field: x");
+    }
 }

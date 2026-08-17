@@ -19,7 +19,7 @@ pub mod mcp;
 pub mod model;
 mod proxy;
 pub mod query;
-pub mod serve;
+pub(crate) mod serve;
 mod sessions;
 pub mod store;
 pub mod upstream;

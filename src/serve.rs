@@ -66,6 +66,20 @@ pub const DEFAULT_UPSTREAM_URL: &str = "http://127.0.0.1:3845/mcp";
 /// `max(interval / session_count, 2s)`).
 const MIN_TICK_DEADLINE: Duration = Duration::from_secs(2);
 
+/// Ceiling for `--interval`, in seconds (one day) — generous for any real
+/// poll cadence, but bounded: this module repeatedly adds `interval` to an
+/// `Instant::now()` (directly, and via [`tick_deadline`]), and an
+/// unclamped user-supplied `u64` (a typo, or an intentionally huge value)
+/// risks overflowing `Instant`'s internal representation and panicking the
+/// first time it's added, rather than failing gracefully.
+const MAX_INTERVAL_SECS: u64 = 86_400;
+
+/// Clamp a raw `--interval` (seconds) to [`MAX_INTERVAL_SECS`] before it's
+/// ever added to an `Instant`.
+fn clamp_interval(interval: u64) -> Duration {
+    Duration::from_secs(interval.min(MAX_INTERVAL_SECS))
+}
+
 /// How long to wait before the next watch tick, given how many sessions
 /// are being round-robin polled: the full `interval` split evenly across
 /// them (so each file gets, on average, one Tier-3 poll per `interval`),
@@ -96,7 +110,7 @@ pub(crate) fn run_serve(
     no_upstream: bool,
     figmog_root: PathBuf,
 ) -> Result<(), String> {
-    let interval_dur = Duration::from_secs(interval);
+    let interval_dur = clamp_interval(interval);
     let token = std::env::var("FIGMA_TOKEN").ok();
 
     let (mut manager, track_current) = build_sessions(
@@ -212,8 +226,21 @@ pub(crate) fn run_serve(
         });
 
         if let Some(resp) = mcp::handle_message(&line, &tools, &mut handler) {
-            println!("{resp}");
-            std::io::stdout().flush().map_err(|e| e.to_string())?;
+            // `println!`/`writeln!` panic on a write error (their internal
+            // `.expect`) — and the overwhelmingly likely error here is the
+            // client's end of the stdio pipe having closed (it exited or
+            // was killed) between our last read and this write, not a real
+            // figmog fault. Write manually so that case is a clean,
+            // expected shutdown (exit 0) rather than a panic or a
+            // broken-pipe error message the operator can't act on.
+            // Untestable cheaply at the e2e level (killing the reading end
+            // of a piped subprocess mid-write isn't something
+            // `assert_cmd`'s harness can trigger deterministically); this
+            // code path is its own proof.
+            let mut stdout = std::io::stdout();
+            if writeln!(stdout, "{resp}").is_err() || stdout.flush().is_err() {
+                return Ok(());
+            }
         }
     }
 }
@@ -569,6 +596,26 @@ mod tests {
         let result =
             st.rtx(|r| dispatch::dispatch_read_tool("get_code", &json!({}), "connected", r));
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn clamp_interval_caps_at_max_and_leaves_sane_values_alone() {
+        assert_eq!(clamp_interval(10), Duration::from_secs(10));
+        assert_eq!(
+            clamp_interval(MAX_INTERVAL_SECS),
+            Duration::from_secs(MAX_INTERVAL_SECS)
+        );
+        // A huge/typo'd interval — including `u64::MAX`, which would
+        // otherwise overflow `Instant::now() + interval` — clamps rather
+        // than propagating.
+        assert_eq!(
+            clamp_interval(u64::MAX),
+            Duration::from_secs(MAX_INTERVAL_SECS)
+        );
+        assert_eq!(
+            clamp_interval(MAX_INTERVAL_SECS + 1),
+            Duration::from_secs(MAX_INTERVAL_SECS)
+        );
     }
 
     #[test]

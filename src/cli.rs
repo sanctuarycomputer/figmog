@@ -58,7 +58,7 @@ enum Cmd {
         /// agents reference them). The first one is the default file for
         /// any tool call that omits `file`.
         files: Vec<String>,
-        /// Poll interval in seconds.
+        /// Poll interval in seconds. Clamped to a one-day maximum.
         #[arg(long, default_value = "10")]
         interval: u64,
         /// Disable the poll loop (offline/fixture use).

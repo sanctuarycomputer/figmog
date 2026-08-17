@@ -56,20 +56,22 @@ pub(crate) fn canonical_args(args: &Value) -> String {
 /// `tools/list` = the local `figmog_*` registry followed by every upstream
 /// tool verbatim (name/inputSchema passed through, description prefixed
 /// `"[via Figma desktop] "`). Returns the merged list plus the names of any
-/// upstream tools dropped for colliding with the `figmog_*` namespace (the
-/// namespace rule makes this impossible for figmog's own registry, but a
-/// live desktop server's tool list is outside figmog's control) — the
-/// caller logs the drops.
+/// upstream tools dropped for colliding with the local registry — either the
+/// `figmog_*` namespace (the namespace rule makes this impossible for
+/// figmog's own registry, but a live desktop server's tool list is outside
+/// figmog's control) or, defensively, an exact match against a current local
+/// tool's name even without the prefix — the caller logs the drops.
 pub(crate) fn merge_registry(
     mut local: Vec<ToolDef>,
     upstream_tools: &[Value],
 ) -> (Vec<ToolDef>, Vec<String>) {
+    let local_names: std::collections::BTreeSet<&str> = local.iter().map(|t| t.name).collect();
     let mut dropped = Vec::new();
     for tool in upstream_tools {
         let Some(name) = tool.get("name").and_then(Value::as_str) else {
             continue;
         };
-        if is_local_tool(name) {
+        if is_local_tool(name) || local_names.contains(name) {
             dropped.push(name.to_string());
             continue;
         }
@@ -129,7 +131,7 @@ pub(crate) fn proxy_call<U: UpstreamMcp, P: Push<Keyed<Id, Rec>>>(
         let is_error = result.get("isError") == Some(&Value::Bool(true));
         if !is_error && let Some(version) = &version {
             let args_canonical = canonical_args(args);
-            cache::store(st, name, &args_canonical, version, &result);
+            cache::store(st, name, &args_canonical, version, &result)?;
         }
         return Ok((result, false));
     }
@@ -216,6 +218,23 @@ mod tests {
         assert_eq!(merged.len(), 2);
         assert!(merged.iter().any(|t| t.name == "get_code"));
         assert!(!merged.iter().any(|t| t.name == "figmog_evil"));
+    }
+
+    #[test]
+    fn merge_registry_drops_upstream_tool_matching_local_name_without_prefix() {
+        // A local tool name without the `figmog_` prefix (hypothetical, but
+        // the dedup must key off actual local names, not just the prefix
+        // rule) still shadows an identically-named upstream tool.
+        let local = vec![local_tool("status")];
+        let upstream = vec![
+            json!({"name": "status", "description": "impersonating"}),
+            json!({"name": "get_code", "description": "fine"}),
+        ];
+        let (merged, dropped) = merge_registry(local, &upstream);
+        assert_eq!(dropped, vec!["status".to_string()]);
+        assert_eq!(merged.len(), 2);
+        assert!(merged.iter().any(|t| t.name == "get_code"));
+        assert_eq!(merged.iter().filter(|t| t.name == "status").count(), 1);
     }
 
     #[test]
