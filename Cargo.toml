@@ -1,0 +1,29 @@
+# Empty on purpose: this guards against Cargo silently treating figmog as a
+# member of some *enclosing* workspace when this repo is checked out nested
+# inside another Cargo project (e.g. a dev checkout under another crate's
+# tree) — an empty [workspace] table makes this crate its own workspace
+# root regardless of what's above it. Harmless as a standalone repo, where
+# there's nothing above it to guard against; kept for that scenario anyway.
+[workspace]
+
+[package]
+name = "figmog"
+version = "0.0.1"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+fold = { git = "https://github.com/flowercomputers/bogkit", rev = "20f2ca50d5d06f51edfe8b8570c0fb48caf9eb81" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2", features = ["json"] }
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
+assert_cmd = "2"
+postcard = { version = "1", features = ["use-std"] }
+
+[profile.dev]
+opt-level = 3 # required for reasonable fold/anny perf
