@@ -48,7 +48,6 @@ fn pull_from_file_reports_churn_and_is_idempotent() {
             response.to_str().unwrap(),
             "--db",
             &db,
-            "--json",
         ])
         .assert()
         .success();
@@ -63,7 +62,6 @@ fn pull_from_file_reports_churn_and_is_idempotent() {
             response.to_str().unwrap(),
             "--db",
             &db,
-            "--json",
         ])
         .assert()
         .success();
@@ -79,7 +77,7 @@ fn status_pages_tree_get_find() {
         let out = Command::cargo_bin("figmog")
             .unwrap()
             .args(args)
-            .args(["--db", &db, "--json"])
+            .args(["--db", &db])
             .assert()
             .success();
         serde_json::from_slice::<serde_json::Value>(&out.get_output().stdout).unwrap()
@@ -129,11 +127,11 @@ fn get_unknown_node_fails_cleanly() {
 }
 
 #[test]
-fn get_unknown_node_json_error_is_json_on_stderr() {
+fn get_unknown_node_error_is_json_on_stderr() {
     let (_dir, db) = fixture_db();
     let out = Command::cargo_bin("figmog")
         .unwrap()
-        .args(["get", "99:99", "--db", &db, "--json"])
+        .args(["get", "99:99", "--db", &db])
         .assert()
         .failure()
         .code(1);
@@ -154,7 +152,7 @@ fn search_instances_components_styles_uses_vars() {
         let out = Command::cargo_bin("figmog")
             .unwrap()
             .args(args)
-            .args(["--db", &db, "--json"])
+            .args(["--db", &db])
             .assert()
             .success();
         serde_json::from_slice::<serde_json::Value>(&out.get_output().stdout).unwrap()
@@ -210,7 +208,7 @@ fn stats_path_text_where_at() {
         let out = Command::cargo_bin("figmog")
             .unwrap()
             .args(args)
-            .args(["--db", &db, "--json"])
+            .args(["--db", &db])
             .assert()
             .success();
         serde_json::from_slice::<serde_json::Value>(&out.get_output().stdout).unwrap()
@@ -319,7 +317,7 @@ fn parent_cycle_does_not_hang_path_or_stats() {
 
     Command::cargo_bin("figmog")
         .unwrap()
-        .args(["stats", "--db", &db, "--json"])
+        .args(["stats", "--db", &db])
         .assert()
         .success();
 }
@@ -338,7 +336,7 @@ fn import_variables_upgrades_vars_to_authoritative() {
 
     let out = Command::cargo_bin("figmog")
         .unwrap()
-        .args(["vars", "--db", &db, "--json"])
+        .args(["vars", "--db", &db])
         .assert()
         .success();
     let vars: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
@@ -401,7 +399,7 @@ fn call_figmog_sync_fails_cleanly_not_panicking() {
     // checks for `figmog_sync` and returns before ever opening its own
     // handle, so this call — which fails during `do_pull`'s own key
     // resolution, since `--db` alone establishes no file key — has to fail
-    // cleanly (exit 1, one plain stderr line), never panic, for the fix to
+    // cleanly (exit 1, one JSON stderr line), never panic, for the fix to
     // hold: a panic would print a backtrace banner and a different exit
     // status instead.
     let (_dir, db) = fixture_db();
@@ -412,23 +410,33 @@ fn call_figmog_sync_fails_cleanly_not_panicking() {
         .assert()
         .failure()
         .code(1);
-    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    let stderr = out.get_output().stderr.clone();
+    let v: serde_json::Value = serde_json::from_slice(&stderr).unwrap_or_else(|e| {
+        panic!(
+            "stderr not JSON: {e}\nstderr: {}",
+            String::from_utf8_lossy(&stderr)
+        )
+    });
     assert!(
-        stderr.starts_with("figmog:"),
-        "expected a clean `figmog: ...` error, got: {stderr}"
+        v["error"].is_string(),
+        "expected a clean {{\"error\": ...}} stderr, got: {v}"
     );
     assert!(
-        !stderr.to_lowercase().contains("panic"),
-        "must not panic: {stderr}"
+        !v["error"]
+            .as_str()
+            .unwrap()
+            .to_lowercase()
+            .contains("panic"),
+        "must not panic: {v}"
     );
 }
 
 #[test]
 fn cli_pull_evicts_stale_cache_rows_on_version_change() {
     // I4: eviction lives inside `do_pull` itself (not just `figmog
-    // serve`'s two inline blocks), so it covers `figmog pull`, `figmog
-    // watch`, and `figmog call figmog_sync` — all three delegate to
-    // `do_pull`. Exercised here through the actual `figmog pull` CLI
+    // serve`'s two inline blocks), so it covers both `figmog pull` and
+    // `figmog call figmog_sync`, which delegate to `do_pull`. Exercised
+    // here through the actual `figmog pull` CLI
     // command (the store handle used to hand-insert the cache row is
     // dropped before each CLI invocation — fjall allows only one open
     // handle per store per process).
@@ -507,129 +515,20 @@ fn cli_pull_evicts_stale_cache_rows_on_version_change() {
     );
 }
 
-/// End-to-end smoke for `figmog bench` (build design §13), synthetic-mode
-/// only (no `FIGMA_TOKEN` in CI): a small corpus/call count keeps this fast
-/// while still exercising every phase — corpus generation, cold sync,
-/// no-churn re-pull, and a real MCP `serve` child driven over stdio.
+/// JSON is the only output mode now (spec §4): the global `--json` flag no
+/// longer exists, so passing it must fail clap's own argument parsing
+/// (unknown flag) rather than being silently accepted.
 #[test]
-fn bench_e2e_synthetic_json_report() {
+fn json_flag_is_rejected_as_unknown() {
+    let (_dir, db) = fixture_db();
     let out = Command::cargo_bin("figmog")
         .unwrap()
-        .args(["bench", "--nodes", "300", "--calls", "60", "--json"])
+        .args(["status", "--db", &db, "--json"])
         .assert()
-        .success();
-    let output = out.get_output();
-
-    // stdout purity: --json means exactly one JSON object, nothing else.
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
-        panic!("stdout was not exactly one JSON object: {e}\nstdout: {stdout}")
-    });
-
-    assert_eq!(v["source"], serde_json::json!("synthetic"));
-    assert_eq!(v["corpus"]["nodes"], serde_json::json!(300));
-    assert_eq!(v["repull"]["churn_zero"], serde_json::json!(true));
-    assert_eq!(v["load"]["total_calls"], serde_json::json!(60));
+        .failure();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
     assert!(
-        v["api"].is_null(),
-        "synthetic mode never runs the API comparison phase"
-    );
-
-    let per_tool = v["load"]["per_tool"].as_array().expect("per_tool array");
-    assert!(!per_tool.is_empty());
-    for tool in per_tool {
-        let p50 = tool["p50_ms"].as_f64().expect("p50_ms is a number");
-        assert!(p50 >= 0.0, "p50 should be non-negative: {tool}");
-    }
-}
-
-/// `--interactive` is a human-only REPL (build design §13): combined with
-/// `--json` it's a usage error, not a silent pick-one. Exit 1, nothing on
-/// stdout, and (since `--json` was set) the error is JSON on stderr —
-/// `cli::run`'s top-level error handler emits `{"error": …}` there when
-/// `cli.json` is true, matching every other command's `--json` error
-/// convention.
-#[test]
-fn bench_interactive_and_json_is_a_usage_error() {
-    let assert = Command::cargo_bin("figmog")
-        .unwrap()
-        .args(["bench", "--nodes", "300", "--interactive", "--json"])
-        .assert()
-        .failure()
-        .code(1);
-    let output = assert.get_output();
-
-    assert!(
-        output.stdout.is_empty(),
-        "stdout must stay empty on a usage error: {:?}",
-        String::from_utf8_lossy(&output.stdout)
-    );
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let v: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap_or_else(|e| {
-        panic!("stderr was not exactly one JSON object: {e}\nstderr: {stderr}")
-    });
-    let msg = v["error"]
-        .as_str()
-        .expect("stderr JSON has an `error` string field");
-    assert!(
-        msg.contains("--interactive") && msg.contains("--json"),
-        "expected the error to name both conflicting flags: {msg:?}"
-    );
-}
-
-/// End-to-end smoke for `figmog bench --interactive` (build design §13
-/// "Interactive mode"), driven non-interactively by piping a command
-/// script into stdin — this is exactly how CI (a non-TTY pipe) exercises
-/// it, and it's also the scenario the "no ANSI in plain mode" guarantee
-/// matters for.
-#[test]
-fn bench_interactive_e2e_scripted_session_is_plain_and_clean() {
-    let script = "help\nstats\nsearch garden\nrun 20\nreport\nquit\n";
-
-    let out = Command::cargo_bin("figmog")
-        .unwrap()
-        .args(["bench", "--nodes", "300", "--interactive"])
-        .write_stdin(script)
-        .assert()
-        .success();
-    let output = out.get_output();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    assert!(
-        !stdout.as_bytes().contains(&0x1b),
-        "non-TTY stdout must contain zero ANSI escape bytes:\n{stdout}"
-    );
-
-    assert!(
-        stdout.contains("figmog_search"),
-        "expected a per-request line naming figmog_search:\n{stdout}"
-    );
-
-    // Sequence numbers are session-wide, not per-command: `stats` fires
-    // #1, `search garden` fires #2, so `run 20`'s 20 numbered per-request
-    // lines are #3 through #22. `#1` and `#20` are both still present
-    // somewhere in that combined stream — the first from `stats`, the
-    // second from partway through the burst — which is enough to confirm
-    // both the pre-burst call and the burst itself actually fired.
-    for n in [1, 20] {
-        let needle = format!("#{n:>4}");
-        assert!(
-            stdout.contains(&needle),
-            "expected a numbered line #{n} ({needle:?}) somewhere in the session:\n{stdout}"
-        );
-    }
-
-    // A report table (headers shared by both `run`'s burst table and
-    // `report`'s cumulative one).
-    assert!(
-        stdout.contains("p50 (ms)") && stdout.contains("p95 (ms)"),
-        "expected a percentile report table:\n{stdout}"
-    );
-
-    // `help`'s command list and a clean `quit`.
-    assert!(
-        stdout.contains("commands:"),
-        "expected `help`'s output:\n{stdout}"
+        stderr.contains("--json") || stderr.to_lowercase().contains("unexpected argument"),
+        "expected clap to reject the removed --json flag: {stderr}"
     );
 }

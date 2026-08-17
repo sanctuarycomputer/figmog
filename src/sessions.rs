@@ -125,12 +125,11 @@ impl FileSession {
 }
 
 /// Run `session.pull()` and apply the same failure-backoff discipline
-/// `cli::pull_failure_wait` gives the CLI's own `pull`/`watch` commands
-/// (Retry-After honored for a rate limit, exponential otherwise, capped):
-/// on success, reseed the session via [`FileSession::note_pull_success`];
-/// on failure, reset `watcher` to the last successfully-synced watermark
-/// (so the same change is re-detected next time — same discipline
-/// `cmd_watch`/the old single-session `run_serve` used) and advance
+/// `cli::pull_failure_wait` gives (Retry-After honored for a rate limit,
+/// exponential otherwise, capped): on success, reseed the session via
+/// [`FileSession::note_pull_success`]; on failure, reset `watcher` to the
+/// last successfully-synced watermark (so the same change is re-detected
+/// next time) and advance
 /// `backoff`, returning the resulting wait alongside the stringified
 /// error so every call site (watch tick, `figmog_sync`, `figmog_open`,
 /// `SessionManager::resolve`'s auto-open) can push its own `next_deadline`

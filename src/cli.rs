@@ -23,14 +23,11 @@ use crate::proxy;
 use crate::query::{self, TextReader};
 use crate::store::{Churn, collect_sweepable, collect_variable_ids, sync};
 use crate::upstream::{HttpUpstream, UpstreamMcp};
-use crate::watch::{BACKOFF_CAP, BACKOFF_START, Tick, Watcher};
+use crate::watch::BACKOFF_CAP;
 
 #[derive(Parser)]
 #[command(name = "figmog", about = "fold-backed local mirror of a Figma file")]
 struct Cli {
-    /// Emit machine-readable JSON on stdout.
-    #[arg(long, global = true)]
-    json: bool,
     /// Store directory (default: .figmog/<file-key>/db).
     #[arg(long, global = true)]
     db: Option<PathBuf>,
@@ -50,13 +47,6 @@ enum Cmd {
         /// Wipe the store and rebuild from scratch.
         #[arg(long)]
         fresh: bool,
-    },
-    /// Poll for changes and pull automatically.
-    Watch {
-        file: Option<String>,
-        /// Poll interval in seconds.
-        #[arg(long, default_value = "10")]
-        interval: u64,
     },
     /// MCP stdio server: `figmog_*` tools over the local mirror, with the
     /// sync loop built in (one process owns the store), plus (unless
@@ -184,92 +174,31 @@ enum Cmd {
         #[arg(long)]
         y: f64,
     },
-    /// Self-contained load-test demo (build design §13): synthetic corpus
-    /// (or a real file's, given one), cold sync, no-churn re-pull, and an
-    /// MCP serve load test over real stdio, plus (real-file mode) a Figma
-    /// API comparison — no mirror/`--db` required.
-    Bench {
-        /// Figma file key or figma.com URL — fetches once (one Tier-1
-        /// call) and benches against the real file. Omitted: a
-        /// deterministic synthetic corpus.
-        file: Option<String>,
-        #[arg(long, default_value = "10000")]
-        nodes: usize,
-        #[arg(long, default_value = "5000")]
-        calls: usize,
-        /// Real-file mode only: number of `GET /nodes` API-comparison calls.
-        #[arg(long, default_value = "5")]
-        api_calls: usize,
-        /// Real-file mode only: skip the API-comparison phase entirely.
-        #[arg(long)]
-        skip_api: bool,
-        /// Leave the temp store on disk and print its path.
-        #[arg(long)]
-        keep: bool,
-        /// Drop into a live REPL instead of the automated phases (build
-        /// design §13 "Interactive mode") — watch tool calls fire in real
-        /// time. Human-only: combining with `--json` is a usage error.
-        #[arg(long)]
-        interactive: bool,
-    },
 }
 
 /// Parse `argv`, dispatch, and return the process exit code (0 on success,
-/// 1 with a one-line `figmog: <message>` on stderr otherwise).
+/// 1 with `{"error": <message>}` on stderr otherwise).
 pub fn run() -> i32 {
     let cli = Cli::parse();
-    let json = cli.json;
     match dispatch(cli) {
         Ok(()) => 0,
         Err(e) => {
-            if json {
-                eprintln!("{}", json!({"error": e}));
-            } else {
-                eprintln!("figmog: {e}");
-            }
+            eprintln!("{}", json!({"error": e}));
             1
         }
     }
 }
 
 fn dispatch(cli: Cli) -> Result<(), String> {
-    // `bench` needs no mirror/db (it builds its own temp store) — handled
-    // here, before `resolve_db`, exactly like the note on `open_store!`'s
-    // unnameable pipeline type below explains for everything else. Matched
-    // by reference so a non-match leaves `cli` untouched for the rest of
-    // this function.
-    if let Cmd::Bench {
-        file,
-        nodes,
-        calls,
-        api_calls,
-        skip_api,
-        keep,
-        interactive,
-    } = &cli.cmd
-    {
-        return cmd_bench(
-            file.clone(),
-            *nodes,
-            *calls,
-            *api_calls,
-            *skip_api,
-            *keep,
-            *interactive,
-            cli.json,
-        );
-    }
-
     // `serve` manages its own (possibly many) session stores via
     // `SessionManager` (`sessions.rs`) rather than the single `Db` every
     // other command resolves below — handled here, before `resolve_db`,
-    // for the same reason `bench` is (see above): matched by reference so
-    // a non-match leaves `cli` untouched for the rest of this function.
-    // The global `--db` flag is still honored as a single-session escape
-    // hatch (spec §14 non-goal: CLI multi-file addressing is out of
-    // scope, and this keeps every pre-v4 `figmog serve --db <path>`
-    // invocation — including this crate's own e2e tests — working
-    // unchanged, single mirror, no `--figmog-root` layout involved).
+    // matched by reference so a non-match leaves `cli` untouched for the
+    // rest of this function. The global `--db` flag is still honored as a
+    // single-session escape hatch (spec §14 non-goal: CLI multi-file
+    // addressing is out of scope, and this keeps every pre-v4 `figmog serve
+    // --db <path>` invocation — including this crate's own e2e tests —
+    // working unchanged, single mirror, no `--figmog-root` layout involved).
     if let Cmd::Serve {
         files,
         interval,
@@ -296,19 +225,18 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             file,
             from_file,
             fresh,
-        } => cmd_pull(&db, file, from_file, fresh, cli.json),
-        Cmd::Watch { file, interval } => cmd_watch(&db, file, interval, cli.json),
-        Cmd::ImportVariables { path } => cmd_import_variables(&db, path, cli.json),
+        } => cmd_pull(&db, file, from_file, fresh),
+        Cmd::ImportVariables { path } => cmd_import_variables(&db, path),
         Cmd::Tools {
             upstream,
             no_upstream,
-        } => cmd_tools(upstream, no_upstream, cli.json),
+        } => cmd_tools(upstream, no_upstream),
         Cmd::Call {
             tool,
             args,
             upstream,
             no_upstream,
-        } => cmd_call(&db, tool, args, upstream, no_upstream, cli.json),
+        } => cmd_call(&db, tool, args, upstream, no_upstream),
         other => {
             // `open_store!`'s pipeline type contains fn items and can't be
             // named, so the store-reading dispatch below must live at this
@@ -317,56 +245,49 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             // opaque associated type there, and a tuple pattern can't
             // destructure an unconstrained associated type.
             let st = open_store_checked(|| crate::open_store!(&db.path))?;
-            let json = cli.json;
             match other {
                 Cmd::Status => st.rtx(|((nodes, _, _, _, _, _, _), _, _, _, _, _, meta, _)| {
-                    cmd_status(&nodes, &meta, json)
+                    cmd_status(&nodes, &meta)
                 }),
-                Cmd::Pages => st
-                    .rtx(|((nodes, _, _, _, _, _, by_type), ..)| cmd_pages(&nodes, &by_type, json)),
+                Cmd::Pages => {
+                    st.rtx(|((nodes, _, _, _, _, _, by_type), ..)| cmd_pages(&nodes, &by_type))
+                }
                 Cmd::Tree { id, depth } => {
                     st.rtx(|((nodes, children, _, _, _, _, by_type), ..)| {
-                        cmd_tree(&nodes, &children, &by_type, id, depth, json)
+                        cmd_tree(&nodes, &children, &by_type, id, depth)
                     })
                 }
                 Cmd::Get {
                     id,
                     children: with_children,
                 } => st.rtx(|((nodes, children, ..), ..)| {
-                    cmd_get(&nodes, &children, id, with_children, json)
+                    cmd_get(&nodes, &children, id, with_children)
                 }),
                 Cmd::Find { node_type, page } => st.rtx(|((nodes, _, _, _, _, _, by_type), ..)| {
-                    cmd_find(&nodes, &by_type, node_type, page, json)
+                    cmd_find(&nodes, &by_type, node_type, page)
                 }),
-                Cmd::Search { query, limit } => st.rtx(|((nodes, _, text, ..), ..)| {
-                    cmd_search(&nodes, &text, query, limit, json)
-                }),
+                Cmd::Search { query, limit } => {
+                    st.rtx(|((nodes, _, text, ..), ..)| cmd_search(&nodes, &text, query, limit))
+                }
                 Cmd::Instances { target } => st.rtx(
                     |((nodes, _, _, instances_of, ..), components, component_sets, ..)| {
-                        cmd_instances(
-                            &nodes,
-                            &instances_of,
-                            &components,
-                            &component_sets,
-                            target,
-                            json,
-                        )
+                        cmd_instances(&nodes, &instances_of, &components, &component_sets, target)
                     },
                 ),
                 Cmd::Components => st.rtx(|((nodes, ..), components, component_sets, ..)| {
-                    cmd_components(&component_sets, &components, &nodes, json)
+                    cmd_components(&component_sets, &components, &nodes)
                 }),
                 Cmd::Styles { style_type, values } => {
                     st.rtx(|((nodes, _, _, _, styled_by, ..), _, _, styles, ..)| {
-                        cmd_styles(&styles, &styled_by, &nodes, style_type, values, json)
+                        cmd_styles(&styles, &styled_by, &nodes, style_type, values)
                     })
                 }
                 Cmd::Uses { id } => st.rtx(|((nodes, _, _, _, styled_by, bound_to, _), ..)| {
-                    cmd_uses(&nodes, &styled_by, &bound_to, id, json)
+                    cmd_uses(&nodes, &styled_by, &bound_to, id)
                 }),
                 Cmd::Vars { id } => st.rtx(
                     |((nodes, ..), _, _, _, variables, variable_collections, _, _)| {
-                        cmd_vars(&nodes, &variables, &variable_collections, id, json)
+                        cmd_vars(&nodes, &variables, &variable_collections, id)
                     },
                 ),
                 Cmd::Stats => st.rtx(
@@ -385,27 +306,24 @@ fn dispatch(cli: Cli) -> Result<(), String> {
                             &styles,
                             &variables,
                             &by_type,
-                            json,
                         )
                     },
                 ),
-                Cmd::Path { id } => st.rtx(|((nodes, ..), ..)| cmd_path(&nodes, id, json)),
-                Cmd::Text { page } => st.rtx(|((nodes, _, _, _, _, _, by_type), ..)| {
-                    cmd_text(&nodes, &by_type, page, json)
-                }),
+                Cmd::Path { id } => st.rtx(|((nodes, ..), ..)| cmd_path(&nodes, id)),
+                Cmd::Text { page } => {
+                    st.rtx(|((nodes, _, _, _, _, _, by_type), ..)| cmd_text(&nodes, &by_type, page))
+                }
                 Cmd::Where {
                     pointer,
                     equals,
                     page,
-                } => st.rtx(|((nodes, ..), ..)| cmd_where(&nodes, pointer, equals, page, json)),
-                Cmd::At { x, y } => st.rtx(|((nodes, ..), ..)| cmd_at(&nodes, x, y, json)),
+                } => st.rtx(|((nodes, ..), ..)| cmd_where(&nodes, pointer, equals, page)),
+                Cmd::At { x, y } => st.rtx(|((nodes, ..), ..)| cmd_at(&nodes, x, y)),
                 Cmd::Pull { .. }
-                | Cmd::Watch { .. }
                 | Cmd::ImportVariables { .. }
                 | Cmd::Serve { .. }
                 | Cmd::Tools { .. }
-                | Cmd::Call { .. }
-                | Cmd::Bench { .. } => {
+                | Cmd::Call { .. } => {
                     unreachable!("handled above")
                 }
             }
@@ -431,12 +349,12 @@ fn resolve_db(cli: &Cli) -> Result<Db, String> {
         });
     }
 
-    // pull/watch with an explicit file ref establish the key for this run.
+    // pull with an explicit file ref establishes the key for this run.
     // `.figmog/current` is only written after a successful sync (see
     // `do_pull`), so a failed pull never repoints later commands. `serve`
     // never reaches here — it's handled, `Db`-free, before this function
     // is even called (see `dispatch`).
-    if let Cmd::Pull { file: Some(f), .. } | Cmd::Watch { file: Some(f), .. } = &cli.cmd {
+    if let Cmd::Pull { file: Some(f), .. } = &cli.cmd {
         let key = parse_file_ref(f).ok_or_else(|| format!("not a Figma file key or URL: {f}"))?;
         return Ok(Db {
             path: db_path_for(&key),
@@ -491,16 +409,16 @@ pub(crate) fn now_ms() -> u64 {
 }
 
 /// The clean, user-facing error every CLI store-opening call site below
-/// translates a locked-store panic into (I-1). `figmog serve`/`figmog
-/// watch` hold fjall's single-writer lock for the life of the process — a
-/// CLI command opening the same `--db` concurrently must not surface fold's
-/// raw `unwrap()` panic (exit 101).
+/// translates a locked-store panic into (I-1). `figmog serve` holds fjall's
+/// single-writer lock for the life of the process — a CLI command opening
+/// the same `--db` concurrently must not surface fold's raw `unwrap()`
+/// panic (exit 101).
 const STORE_LOCKED_MSG: &str = "store is locked — is `figmog serve` running? Query the server instead (figmog call/tools), or stop it first.";
 
 /// `open_store!` (via `fold::stream::Stream::new`) panics rather than
 /// returning a `Result` when the underlying store can't be opened — most
-/// commonly because another process (`figmog serve` or `figmog watch`)
-/// already holds fjall's single-writer lock (`fjall::Error::Locked`). fold
+/// commonly because another process (`figmog serve`) already holds fjall's
+/// single-writer lock (`fjall::Error::Locked`). fold
 /// itself stays untouched (its panic-on-open contract is intentional and
 /// shared by `wtx`'s own rollback-on-panic path); this wrapper is figmog's
 /// layer, catching that one specific panic and translating it into a clean
@@ -572,16 +490,15 @@ fn cmd_pull(
     file: Option<String>,
     from_file: Option<PathBuf>,
     fresh: bool,
-    json: bool,
 ) -> Result<(), String> {
-    let (churn, name, version) = do_pull(db, file, from_file, fresh).map_err(|e| e.to_string())?;
-    print_churn(&churn, &name, &version, json)
+    let (churn, _name, _version) =
+        do_pull(db, file, from_file, fresh).map_err(|e| e.to_string())?;
+    print_churn(&churn)
 }
 
-/// The pull mechanics without any printing, so `cmd_watch` can format its
-/// own per-tick event lines around the same churn. `.figmog/current` is
-/// written only once the sync below has actually happened, so a failed
-/// pull never repoints later commands at a nonexistent mirror.
+/// The pull mechanics without any printing. `.figmog/current` is written
+/// only once the sync below has actually happened, so a failed pull never
+/// repoints later commands at a nonexistent mirror.
 pub(crate) fn do_pull(
     db: &Db,
     file: Option<String>,
@@ -640,9 +557,9 @@ pub(crate) fn do_pull(
         st.rtx(|(_, _, _, _, _, _, meta, _)| meta.get(&0).map(|m| m.version.clone()));
     let churn = sync(&mut st, &prior, &flattened, now_ms());
 
-    // Every caller of `do_pull` (`pull`, `watch`'s per-tick pull, and
-    // `figmog call figmog_sync`) goes through here, so eviction lives here
-    // rather than duplicated at each call site (build design §12: a
+    // Every caller of `do_pull` (`pull` and `figmog call figmog_sync`) goes
+    // through here, so eviction lives here rather than duplicated at each
+    // call site (build design §12: a
     // version-changing pull sweeps stale `proxy_cache` rows). `figmog
     // serve`'s own pull paths don't call `do_pull` — they keep their own
     // inline eviction blocks, since they already hold `st` open and
@@ -668,104 +585,19 @@ pub(crate) fn do_pull(
     ))
 }
 
-fn print_churn(churn: &Churn, name: &str, version: &str, json: bool) -> Result<(), String> {
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string(churn).map_err(|e| e.to_string())?
-        );
-    } else {
-        println!(
-            "synced {name} v{version}: +{} ~{} -{} (={} unchanged)",
-            churn.added, churn.changed, churn.removed, churn.unchanged
-        );
-    }
+fn print_churn(churn: &Churn) -> Result<(), String> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(churn).map_err(|e| e.to_string())?
+    );
     Ok(())
 }
 
-fn cmd_watch(db: &Db, file: Option<String>, interval: u64, json: bool) -> Result<(), String> {
-    let key = db
-        .key
-        .clone()
-        .or_else(|| file.and_then(|f| parse_file_ref(&f)))
-        .ok_or_else(|| "no file key: pass a file key or figma.com URL".to_string())?;
-    let token = std::env::var("FIGMA_TOKEN")
-        .map_err(|_| "FIGMA_TOKEN not set — required for watch".to_string())?;
-    let api = UreqApi::new(token);
-
-    if read_watermark(db)?.is_none() {
-        cmd_pull(db, Some(key.clone()), None, false, json)?;
-    }
-
-    let mut stored = read_watermark(db)?;
-    let mut watcher = Watcher::new(stored.clone());
-    let interval = Duration::from_secs(interval);
-    // Backoff for Tier-1 pull failures, independent of the Watcher's own
-    // Tier-3 meta-poll backoff — reset on any successful pull.
-    let mut pull_backoff = BACKOFF_START;
-
-    loop {
-        match watcher.tick(&api, &key) {
-            Tick::Unchanged => std::thread::sleep(interval),
-            Tick::Wait { after } => {
-                if json {
-                    println!(
-                        "{}",
-                        json!({"event": "waiting", "seconds": after.as_secs()})
-                    );
-                } else {
-                    println!("waiting {}s", after.as_secs());
-                }
-                std::thread::sleep(after);
-            }
-            Tick::Changed { .. } => {
-                if json {
-                    println!("{}", json!({"event": "changed"}));
-                } else {
-                    println!("changed → pulling…");
-                }
-                match do_pull(db, Some(key.clone()), None, false) {
-                    Ok((churn, name, version)) => {
-                        stored = read_watermark(db)?;
-                        pull_backoff = BACKOFF_START;
-                        if json {
-                            let mut v = serde_json::to_value(&churn).unwrap_or_default();
-                            if let Some(obj) = v.as_object_mut() {
-                                obj.insert("event".to_string(), json!("pulled"));
-                            }
-                            println!("{v}");
-                        } else {
-                            println!(
-                                "synced {name} v{version}: +{} ~{} -{} (={} unchanged)",
-                                churn.added, churn.changed, churn.removed, churn.unchanged
-                            );
-                        }
-                        std::thread::sleep(interval);
-                    }
-                    Err(e) => {
-                        eprintln!("figmog: pull failed: {e}");
-                        // Watcher already advanced its watermark; reset it to
-                        // the last successfully-synced one so the same
-                        // change is re-detected on the next tick.
-                        watcher = Watcher::new(stored.clone());
-                        let wait = pull_failure_wait(&e, &mut pull_backoff, interval);
-                        if json {
-                            println!("{}", json!({"event": "waiting", "seconds": wait.as_secs()}));
-                        } else {
-                            println!("waiting {}s", wait.as_secs());
-                        }
-                        std::thread::sleep(wait);
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// How long `cmd_watch` should sleep after a failed pull, and advance the
-/// per-loop backoff state. `RateLimited` honors `Retry-After` (never less
-/// than the normal poll interval); anything else gets the same exponential
-/// backoff discipline the [`Watcher`] uses for Tier-3 meta failures.
+/// How long a failed pull's caller (`figmog serve`'s sessions, via
+/// `sessions.rs`) should wait before retrying, and advance the per-loop
+/// backoff state. `RateLimited` honors `Retry-After` (never less than the
+/// normal poll interval); anything else gets the same exponential backoff
+/// discipline the [`Watcher`] uses for Tier-3 meta failures.
 pub(crate) fn pull_failure_wait(
     err: &PullError,
     backoff: &mut Duration,
@@ -780,7 +612,7 @@ pub(crate) fn pull_failure_wait(
     }
 }
 
-fn cmd_import_variables(db: &Db, path: PathBuf, json: bool) -> Result<(), String> {
+fn cmd_import_variables(db: &Db, path: PathBuf) -> Result<(), String> {
     let content =
         std::fs::read_to_string(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
     let v: Value =
@@ -798,68 +630,11 @@ fn cmd_import_variables(db: &Db, path: PathBuf, json: bool) -> Result<(), String
         .iter()
         .filter(|(id, _)| matches!(id, Id::Variable(_)))
         .count();
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string(&json!({"imported": imported})).map_err(|e| e.to_string())?
-        );
-    } else {
-        println!("imported {imported} variables");
-    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({"imported": imported})).map_err(|e| e.to_string())?
+    );
     Ok(())
-}
-
-/// `figmog bench [file] [--nodes N] [--calls M] [--api-calls K] [--skip-api]
-/// [--keep] [--interactive]` (build design §13). Needs no resolved `Db` —
-/// see `dispatch`'s early handling — so it never touches `.figmog/current`
-/// or `--db`.
-#[allow(clippy::too_many_arguments)]
-fn cmd_bench(
-    file: Option<String>,
-    nodes: usize,
-    calls: usize,
-    api_calls: usize,
-    skip_api: bool,
-    keep: bool,
-    interactive: bool,
-    json: bool,
-) -> Result<(), String> {
-    if interactive && json {
-        return Err(
-            "--interactive is a human-only REPL and cannot be combined with --json".to_string(),
-        );
-    }
-    let file = file
-        .map(|f| parse_file_ref(&f).ok_or_else(|| format!("not a Figma file key or URL: {f}")))
-        .transpose()?;
-    let exe = std::env::current_exe().map_err(|e| format!("resolving current exe: {e}"))?;
-    let opts = crate::bench::BenchOpts {
-        nodes,
-        calls,
-        keep,
-        exe,
-        file,
-        api_calls,
-        skip_api,
-    };
-    if interactive {
-        return crate::bench::run_interactive(opts);
-    }
-    let report = crate::bench::run(opts)?;
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
-        );
-    } else {
-        crate::bench::print_human(&report);
-    }
-    Ok(())
-}
-
-pub(crate) fn read_watermark(db: &Db) -> Result<Option<String>, String> {
-    let st = open_store_checked(|| crate::open_store!(&db.path))?;
-    Ok(st.rtx(|(_, _, _, _, _, _, meta, _)| meta.get(&0).map(|m| m.last_modified)))
 }
 
 // ---- cached-proxy CLI parity: `figmog tools` / `figmog call` ----
@@ -886,7 +661,7 @@ fn attach_upstream(
 
 /// `figmog tools`: the merged registry `figmog serve` would expose for this
 /// mirror — local tools always, upstream tools when reachable.
-fn cmd_tools(upstream_url: String, no_upstream: bool, json: bool) -> Result<(), String> {
+fn cmd_tools(upstream_url: String, no_upstream: bool) -> Result<(), String> {
     let (upstream, status) = attach_upstream(upstream_url, no_upstream);
     let (tools, dropped) = match &upstream {
         Some(u) => proxy::merge_registry(dispatch::tool_registry(), u.tools()),
@@ -895,39 +670,24 @@ fn cmd_tools(upstream_url: String, no_upstream: bool, json: bool) -> Result<(), 
     for name in &dropped {
         eprintln!("figmog: dropping upstream tool named like a local tool: {name}");
     }
-
-    if json {
-        let rows: Vec<Value> = tools
-            .iter()
-            .map(|t| {
-                json!({
-                    "name": t.name,
-                    "source": if proxy::is_local_tool(t.name) { "local" } else { "upstream" },
-                    "cacheable": proxy::tool_name_cache_capable(t.name),
-                })
-            })
-            .collect();
-        println!(
-            "{}",
-            serde_json::to_string(&rows).map_err(|e| e.to_string())?
-        );
-    } else {
-        for t in &tools {
-            let source = if proxy::is_local_tool(t.name) {
-                "local"
-            } else {
-                "upstream"
-            };
-            println!(
-                "{}  [{source}]  cacheable={}",
-                t.name,
-                proxy::tool_name_cache_capable(t.name)
-            );
-        }
-        if status != "connected" {
-            eprintln!("figmog: upstream {status} — showing local tools only");
-        }
+    if status != "connected" {
+        eprintln!("figmog: upstream {status} — showing local tools only");
     }
+
+    let rows: Vec<Value> = tools
+        .iter()
+        .map(|t| {
+            json!({
+                "name": t.name,
+                "source": if proxy::is_local_tool(t.name) { "local" } else { "upstream" },
+                "cacheable": proxy::tool_name_cache_capable(t.name),
+            })
+        })
+        .collect();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&rows).map_err(|e| e.to_string())?
+    );
     Ok(())
 }
 
@@ -941,7 +701,6 @@ fn cmd_call(
     args: Option<String>,
     upstream_url: String,
     no_upstream: bool,
-    json: bool,
 ) -> Result<(), String> {
     let args: Value = match args {
         Some(raw) => {
@@ -963,7 +722,7 @@ fn cmd_call(
         let result = do_pull(db, None, None, false)
             .map(|(churn, _name, _version)| serde_json::to_value(&churn).unwrap_or_default())
             .map_err(|e| e.to_string());
-        return print_call_result(result, json);
+        return print_call_result(result);
     }
 
     let (mut upstream, upstream_status) = attach_upstream(upstream_url, no_upstream);
@@ -1000,83 +759,48 @@ fn cmd_call(
         })
     };
 
-    print_call_result(result, json)
+    print_call_result(result)
 }
 
-/// Shared `figmog call` output: pretty-printed JSON on success; on
-/// failure, `{"error": ...}` on stdout (exit 0) under `--json`, otherwise
-/// the plain error via the normal `figmog: <message>` / exit-1 path (see
-/// `run`).
-fn print_call_result(result: Result<Value, String>, json: bool) -> Result<(), String> {
-    match result {
-        Ok(v) => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?
-            );
-            Ok(())
-        }
-        Err(e) if json => {
-            println!("{}", json!({"error": e}));
-            Ok(())
-        }
-        Err(e) => Err(e),
-    }
+/// Shared `figmog call` output: pretty-printed JSON on success; on failure,
+/// propagates the error so `run`'s top-level handler emits `{"error": ...}`
+/// on stderr and exits 1, same as every other command.
+fn print_call_result(result: Result<Value, String>) -> Result<(), String> {
+    let v = result?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?
+    );
+    Ok(())
 }
 
 // ---- core reads ----
+//
+// Every read command below prints its `query::*` `Value` as pretty-printed
+// JSON on stdout — the only output mode (spec §4). Failures propagate as
+// `Err(String)`, which `run`'s top-level handler renders as `{"error":
+// ...}` on stderr with exit 1.
+
+fn print_value(v: &Value) -> Result<(), String> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(v).map_err(|e| e.to_string())?
+    );
+    Ok(())
+}
 
 fn cmd_status<R: Readable>(
     nodes: &TableReader<'_, R, String, NodeRec>,
     meta: &TableReader<'_, R, u8, FileMeta>,
-    json: bool,
 ) -> Result<(), String> {
-    let v = query::status(nodes, meta)?;
-    if json {
-        println!("{}", serde_json::to_string(&v).map_err(|e| e.to_string())?);
-    } else {
-        println!(
-            "{} v{} — {} nodes (last modified {})",
-            v["name"].as_str().unwrap_or_default(),
-            v["version"].as_str().unwrap_or_default(),
-            v["nodes"].as_u64().unwrap_or_default(),
-            v["last_modified"].as_str().unwrap_or_default(),
-        );
-    }
-    Ok(())
+    print_value(&query::status(nodes, meta)?)
 }
 
 fn cmd_pages<R: Readable>(
     nodes: &TableReader<'_, R, String, NodeRec>,
     by_type: &InvertedIndexReader<'_, R, String, String>,
-    json: bool,
 ) -> Result<(), String> {
-    let v = query::pages(nodes, by_type)?;
-    if json {
-        println!("{}", serde_json::to_string(&v).map_err(|e| e.to_string())?);
-    } else {
-        for row in v.as_array().into_iter().flatten() {
-            println!(
-                "{}  {}",
-                row["name"].as_str().unwrap_or_default(),
-                row["id"].as_str().unwrap_or_default(),
-            );
-        }
-    }
-    Ok(())
-}
-
-fn print_tree_human(t: &query::TreeNode, indent: usize) {
-    println!(
-        "{}{}  [{}]  {}",
-        "  ".repeat(indent),
-        t.name,
-        t.node_type,
-        t.id
-    );
-    for c in &t.children {
-        print_tree_human(c, indent + 1);
-    }
+    print_value(&query::pages(nodes, by_type)?)
 }
 
 fn cmd_tree<R: Readable>(
@@ -1085,16 +809,8 @@ fn cmd_tree<R: Readable>(
     by_type: &InvertedIndexReader<'_, R, String, String>,
     id: Option<String>,
     depth: Option<usize>,
-    json: bool,
 ) -> Result<(), String> {
-    if json {
-        let v = query::tree(nodes, children, by_type, id, depth)?;
-        println!("{}", serde_json::to_string(&v).map_err(|e| e.to_string())?);
-    } else {
-        let t = query::tree_nodes(nodes, children, by_type, id, depth)?;
-        print_tree_human(&t, 0);
-    }
-    Ok(())
+    print_value(&query::tree(nodes, children, by_type, id, depth)?)
 }
 
 fn cmd_get<R: Readable>(
@@ -1102,15 +818,8 @@ fn cmd_get<R: Readable>(
     children: &MultimapReader<'_, R, String, (u32, String)>,
     id: String,
     with_children: bool,
-    _json: bool,
 ) -> Result<(), String> {
-    let value = query::node(nodes, children, id, with_children)?;
-    // Get's output is always JSON, whether or not --json was passed.
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
-    );
-    Ok(())
+    print_value(&query::node(nodes, children, id, with_children)?)
 }
 
 fn cmd_find<R: Readable>(
@@ -1118,22 +827,8 @@ fn cmd_find<R: Readable>(
     by_type: &InvertedIndexReader<'_, R, String, String>,
     node_type: String,
     page: Option<String>,
-    json: bool,
 ) -> Result<(), String> {
-    let v = query::find(nodes, by_type, node_type, page)?;
-    if json {
-        println!("{}", serde_json::to_string(&v).map_err(|e| e.to_string())?);
-    } else {
-        for row in v.as_array().into_iter().flatten() {
-            println!(
-                "{}  {}  ({})",
-                row["id"].as_str().unwrap_or_default(),
-                row["name"].as_str().unwrap_or_default(),
-                row["page_id"].as_str().unwrap_or_default(),
-            );
-        }
-    }
-    Ok(())
+    print_value(&query::find(nodes, by_type, node_type, page)?)
 }
 
 // ---- design-system reads ----
@@ -1143,23 +838,8 @@ fn cmd_search<R: Readable>(
     text: &TextReader<'_, R>,
     query: String,
     limit: usize,
-    json: bool,
 ) -> Result<(), String> {
-    let v = query::search(text, nodes, &query, limit)?;
-    if json {
-        println!("{}", serde_json::to_string(&v).map_err(|e| e.to_string())?);
-    } else {
-        for row in v.as_array().into_iter().flatten() {
-            println!(
-                "{}  {:.3}  [{}]  {}",
-                row["id"].as_str().unwrap_or_default(),
-                row["score"].as_f64().unwrap_or_default(),
-                row["type"].as_str().unwrap_or_default(),
-                row["name"].as_str().unwrap_or_default(),
-            );
-        }
-    }
-    Ok(())
+    print_value(&query::search(text, nodes, &query, limit)?)
 }
 
 fn cmd_instances<R: Readable>(
@@ -1168,50 +848,22 @@ fn cmd_instances<R: Readable>(
     components: &TableReader<'_, R, String, ComponentRec>,
     component_sets: &TableReader<'_, R, String, ComponentSetRec>,
     target: String,
-    json: bool,
 ) -> Result<(), String> {
-    let v = query::instances(nodes, components, component_sets, instances_of, &target)?;
-    if json {
-        println!("{}", serde_json::to_string(&v).map_err(|e| e.to_string())?);
-    } else {
-        for row in v.as_array().into_iter().flatten() {
-            println!(
-                "{}  {}  ({})",
-                row["id"].as_str().unwrap_or_default(),
-                row["name"].as_str().unwrap_or_default(),
-                row["page_id"].as_str().unwrap_or_default(),
-            );
-        }
-    }
-    Ok(())
+    print_value(&query::instances(
+        nodes,
+        components,
+        component_sets,
+        instances_of,
+        &target,
+    )?)
 }
 
 fn cmd_components<R: Readable>(
     component_sets: &TableReader<'_, R, String, ComponentSetRec>,
     components: &TableReader<'_, R, String, ComponentRec>,
     nodes: &TableReader<'_, R, String, NodeRec>,
-    json: bool,
 ) -> Result<(), String> {
-    let v = query::components(nodes, components, component_sets)?;
-    if json {
-        println!("{}", serde_json::to_string(&v).map_err(|e| e.to_string())?);
-    } else {
-        for s in v["sets"].as_array().into_iter().flatten() {
-            println!(
-                "{}  {} variants",
-                s["name"].as_str().unwrap_or_default(),
-                s["variants"].as_array().map(Vec::len).unwrap_or(0),
-            );
-        }
-        for c in v["components"].as_array().into_iter().flatten() {
-            println!(
-                "{}  {}",
-                c["node_id"].as_str().unwrap_or_default(),
-                c["name"].as_str().unwrap_or_default()
-            );
-        }
-    }
-    Ok(())
+    print_value(&query::components(nodes, components, component_sets)?)
 }
 
 fn cmd_styles<R: Readable>(
@@ -1220,23 +872,10 @@ fn cmd_styles<R: Readable>(
     nodes: &TableReader<'_, R, String, NodeRec>,
     style_type: Option<String>,
     values: bool,
-    json: bool,
 ) -> Result<(), String> {
-    let v = query::styles(nodes, styles, styled_by, style_type, values)?;
-    if json {
-        println!("{}", serde_json::to_string(&v).map_err(|e| e.to_string())?);
-    } else {
-        for row in v.as_array().into_iter().flatten() {
-            println!(
-                "{}  {}  [{}]  uses={}",
-                row["style_id"].as_str().unwrap_or_default(),
-                row["name"].as_str().unwrap_or_default(),
-                row["type"].as_str().unwrap_or_default(),
-                row["uses"].as_u64().unwrap_or_default(),
-            );
-        }
-    }
-    Ok(())
+    print_value(&query::styles(
+        nodes, styles, styled_by, style_type, values,
+    )?)
 }
 
 fn cmd_uses<R: Readable>(
@@ -1244,22 +883,8 @@ fn cmd_uses<R: Readable>(
     styled_by: &InvertedIndexReader<'_, R, String, String>,
     bound_to: &InvertedIndexReader<'_, R, String, String>,
     id: String,
-    json: bool,
 ) -> Result<(), String> {
-    let v = query::uses(nodes, styled_by, bound_to, &id)?;
-    if json {
-        println!("{}", serde_json::to_string(&v).map_err(|e| e.to_string())?);
-    } else {
-        for row in v.as_array().into_iter().flatten() {
-            println!(
-                "{}  {}  ({})",
-                row["id"].as_str().unwrap_or_default(),
-                row["name"].as_str().unwrap_or_default(),
-                row["page_id"].as_str().unwrap_or_default(),
-            );
-        }
-    }
-    Ok(())
+    print_value(&query::uses(nodes, styled_by, bound_to, &id)?)
 }
 
 fn cmd_vars<R: Readable>(
@@ -1267,35 +892,18 @@ fn cmd_vars<R: Readable>(
     variables: &TableReader<'_, R, String, VariableRec>,
     variable_collections: &TableReader<'_, R, String, VariableCollectionRec>,
     id: Option<String>,
-    json: bool,
 ) -> Result<(), String> {
-    let v = query::vars(nodes, variables, variable_collections, id)?;
-    if json {
-        println!("{}", serde_json::to_string(&v).map_err(|e| e.to_string())?);
-    } else {
-        for row in v.as_array().into_iter().flatten() {
-            println!(
-                "{}  [{}]  sites={}",
-                row["variable_id"].as_str().unwrap_or_default(),
-                row["source"].as_str().unwrap_or_default(),
-                row["sites"].as_array().map(Vec::len).unwrap_or(0),
-            );
-        }
-    }
-    Ok(())
+    print_value(&query::vars(nodes, variables, variable_collections, id)?)
 }
 
 // ---- whole-file structural queries ----
 
 /// `--equals <json>`: parse as JSON, falling back to treating the bare word
-/// as a JSON string (so `--equals VERTICAL` works without quoting). Also
-/// used by the interactive REPL's `where <pointer> [value]` shorthand
-/// (`repl::parse_line`) — same fallback semantics there.
+/// as a JSON string (so `--equals VERTICAL` works without quoting).
 pub(crate) fn parse_equals(raw: &str) -> Value {
     serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn cmd_stats<R: Readable>(
     nodes: &TableReader<'_, R, String, NodeRec>,
     components: &TableReader<'_, R, String, ComponentRec>,
@@ -1303,88 +911,30 @@ fn cmd_stats<R: Readable>(
     styles: &TableReader<'_, R, String, StyleRec>,
     variables: &TableReader<'_, R, String, VariableRec>,
     by_type: &InvertedIndexReader<'_, R, String, String>,
-    json: bool,
 ) -> Result<(), String> {
-    let v = query::stats(
+    print_value(&query::stats(
         nodes,
         components,
         component_sets,
         styles,
         variables,
         by_type,
-    )?;
-    if json {
-        println!("{}", serde_json::to_string(&v).map_err(|e| e.to_string())?);
-    } else {
-        println!(
-            "{} nodes, max depth {}, {} text nodes",
-            v["by_type"]
-                .as_object()
-                .map(|m| m.values().filter_map(Value::as_u64).sum::<u64>())
-                .unwrap_or_default(),
-            v["max_depth"].as_u64().unwrap_or_default(),
-            v["text_nodes"].as_u64().unwrap_or_default(),
-        );
-        println!(
-            "totals: components={} component_sets={} styles={} variables={}",
-            v["totals"]["components"].as_u64().unwrap_or_default(),
-            v["totals"]["component_sets"].as_u64().unwrap_or_default(),
-            v["totals"]["styles"].as_u64().unwrap_or_default(),
-            v["totals"]["variables"].as_u64().unwrap_or_default(),
-        );
-        println!("by type:");
-        for (t, n) in v["by_type"].as_object().into_iter().flatten() {
-            println!("  {t}  {n}");
-        }
-        println!("by page:");
-        for (p, n) in v["by_page"].as_object().into_iter().flatten() {
-            println!("  {p}  {n}");
-        }
-    }
-    Ok(())
+    )?)
 }
 
 fn cmd_path<R: Readable>(
     nodes: &TableReader<'_, R, String, NodeRec>,
     id: String,
-    json: bool,
 ) -> Result<(), String> {
-    let v = query::path(nodes, id)?;
-    if json {
-        println!("{}", serde_json::to_string(&v).map_err(|e| e.to_string())?);
-    } else {
-        for row in v.as_array().into_iter().flatten() {
-            println!(
-                "{}  [{}]  {}",
-                row["id"].as_str().unwrap_or_default(),
-                row["type"].as_str().unwrap_or_default(),
-                row["name"].as_str().unwrap_or_default(),
-            );
-        }
-    }
-    Ok(())
+    print_value(&query::path(nodes, id)?)
 }
 
 fn cmd_text<R: Readable>(
     nodes: &TableReader<'_, R, String, NodeRec>,
     by_type: &InvertedIndexReader<'_, R, String, String>,
     page: Option<String>,
-    json: bool,
 ) -> Result<(), String> {
-    let v = query::text(nodes, by_type, page)?;
-    if json {
-        println!("{}", serde_json::to_string(&v).map_err(|e| e.to_string())?);
-    } else {
-        for row in v.as_array().into_iter().flatten() {
-            println!(
-                "{}  ({})  {}",
-                row["id"].as_str().unwrap_or_default(),
-                row["page_id"].as_str().unwrap_or_default(),
-                row["characters"].as_str().unwrap_or_default(),
-            );
-        }
-    }
-    Ok(())
+    print_value(&query::text(nodes, by_type, page)?)
 }
 
 fn cmd_where<R: Readable>(
@@ -1392,56 +942,27 @@ fn cmd_where<R: Readable>(
     pointer: String,
     equals: Option<String>,
     page: Option<String>,
-    json: bool,
 ) -> Result<(), String> {
     let equals = equals.as_deref().map(parse_equals);
-    let v = query::where_(nodes, &pointer, equals, page)?;
-    if json {
-        println!("{}", serde_json::to_string(&v).map_err(|e| e.to_string())?);
-    } else {
-        for row in v.as_array().into_iter().flatten() {
-            println!(
-                "{}  {}  ({})  {}",
-                row["id"].as_str().unwrap_or_default(),
-                row["name"].as_str().unwrap_or_default(),
-                row["page_id"].as_str().unwrap_or_default(),
-                row["value"],
-            );
-        }
-    }
-    Ok(())
+    print_value(&query::where_(nodes, &pointer, equals, page)?)
 }
 
 fn cmd_at<R: Readable>(
     nodes: &TableReader<'_, R, String, NodeRec>,
     x: f64,
     y: f64,
-    json: bool,
 ) -> Result<(), String> {
-    let v = query::at(nodes, x, y)?;
-    if json {
-        println!("{}", serde_json::to_string(&v).map_err(|e| e.to_string())?);
-    } else {
-        for row in v.as_array().into_iter().flatten() {
-            println!(
-                "{}  {}  [{}]  area={}",
-                row["id"].as_str().unwrap_or_default(),
-                row["name"].as_str().unwrap_or_default(),
-                row["type"].as_str().unwrap_or_default(),
-                row["area"].as_f64().unwrap_or_default(),
-            );
-        }
-    }
-    Ok(())
+    print_value(&query::at(nodes, x, y)?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::watch::BACKOFF_START;
 
     /// I-1: a store opened a second time in-process while the first handle
     /// is still held reproduces the exact panic a CLI command hits against
-    /// a running `figmog serve`/`figmog watch` (fjall's file lock conflicts
+    /// a running `figmog serve` (fjall's file lock conflicts
     /// on the second `File::try_lock`, regardless of whether the two opens
     /// are in the same process or different ones — see
     /// `fjall::locked_file::LockedFileGuard`). `open_store_checked` must

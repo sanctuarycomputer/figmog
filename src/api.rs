@@ -107,14 +107,6 @@ impl UreqApi {
             Err(e) => Err(ApiError::Network(e.to_string())),
         }
     }
-
-    /// `GET /v1/files/:key/nodes?ids=<id>` — the native API's closest
-    /// equivalent of `figmog_node`. Used only by `figmog bench`'s real-file
-    /// API-comparison phase (build design §13); no other call site needs
-    /// this endpoint, so it isn't part of the [`FigmaApi`] trait.
-    pub(crate) fn file_nodes(&self, key: &str, id: &str) -> Result<Value, ApiError> {
-        self.get_json(&format!("/v1/files/{key}/nodes?ids={id}"))
-    }
 }
 
 impl FigmaApi for UreqApi {

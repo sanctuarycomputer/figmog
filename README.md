@@ -1,5 +1,8 @@
 # figmog
 
+*(README rewrite lands in a later commit — this pass only strips sections
+that would otherwise describe removed surfaces.)*
+
 A fold-backed local mirror of one Figma file: `pull` fetches it once and
 keeps materialized indexes in a fold database, so every read after that —
 search, tree walks, component/style/variable queries — answers from local
@@ -12,25 +15,24 @@ rate limits.
 $ export FIGMA_TOKEN=figd_…            # figma.com → settings → security → personal access tokens
 $ cargo run -p figmog -- pull "https://www.figma.com/design/<key>/<name>"
 $ cargo run -p figmog -- search "pricing card"
-$ cargo run -p figmog -- watch          # keep it fresh in another terminal
+$ cargo run -p figmog -- serve          # MCP server with its own poll loop, in another terminal
 ```
 
 After the first `pull`, figmog remembers the file key (in `.figmog/current`
-under the current directory), so every later command — including `watch`
-and all the read commands below — can drop the file argument.
+under the current directory), so every later command — including all the
+read commands below — can drop the file argument.
 
 ## Commands
 
 Read commands never touch the network: they open the local store and read
-one snapshot. `--json` (global) emits machine-readable JSON on stdout
-instead of the human-readable format; `--db <path>` (global) overrides the
-store location (default `.figmog/<file-key>/db`).
+one snapshot, and always print machine-readable JSON on stdout (pretty-
+printed); errors always print `{"error": ...}` on stderr. `--db <path>`
+(global) overrides the store location (default `.figmog/<file-key>/db`).
 
 | command | reads | behavior |
 |---|---|---|
 | `figmog pull [file] [--from-file <json>] [--fresh]` | — | sync now; prints a churn summary (`+added ~changed -removed`). `file` is optional after the first pull. `--from-file` ingests a saved `GET /v1/files/:key` response instead of the network (offline ingestion, and what keeps the CLI tests hermetic). `--fresh` wipes the store **and the proxy response cache** and rebuilds from scratch. |
-| `figmog watch [file] [--interval N]` | — | poll loop: cheap metadata check every `N` seconds (default 10), full pull only on an actual change |
-| `figmog serve [file] [--interval N] [--no-watch] [--upstream <url>] [--no-upstream]` | — | MCP stdio server (see "Use from agents (MCP)" below); `--no-watch` disables the poll loop for a read-only, offline server; `--no-upstream` disables the cached proxy to Figma's native desktop MCP server |
+| `figmog serve [file] [--interval N] [--no-watch] [--upstream <url>] [--no-upstream]` | — | MCP stdio server (see "Use from agents (MCP)" below); polls for changes itself (`--interval` seconds, default 10) and pulls only on an actual change; `--no-watch` disables that poll loop for a read-only, offline server; `--no-upstream` disables the cached proxy to Figma's native desktop MCP server |
 | `figmog tools [--upstream <url>] [--no-upstream]` | — | list every tool `figmog serve` would expose for this mirror: name, source (`local`/`upstream`), and whether it's cache-capable |
 | `figmog call <tool> [--args '<json>'] [--upstream <url>] [--no-upstream]` | — | invoke any tool by name through the same dispatch `figmog serve` uses — local `figmog_*` tools and, when attached, any upstream tool |
 | `figmog status` | meta + nodes | file name, version, last modified, node count |
@@ -50,35 +52,34 @@ store location (default `.figmog/<file-key>/db`).
 | `figmog text [--page <id>]` | by_type + nodes | every TEXT node's `(id, characters, page_id)`, sorted by id |
 | `figmog where --pointer </p> [--equals <json>] [--page <id>]` | nodes | nodes whose raw JSON matches an RFC 6901 `pointer`, optionally filtered by `equals` (parsed as JSON, falling back to a bare string so `--equals VERTICAL` works) |
 | `figmog at --x N --y N` | nodes | nodes whose absolute bounds contain the point, sorted by area ascending (deepest/smallest first) |
-| `figmog bench [file] [--nodes N] [--calls M] [--api-calls K] [--skip-api] [--keep] [--interactive]` | — | self-contained load-test demo, or (`--interactive`) a live REPL — see "Demo: load-testing the server" below — needs no mirror/`--db` |
 
 Node ids accept both `12:34` and `12-34` forms everywhere. Auth is a
-personal access token from `FIGMA_TOKEN`. Since `pull`/`watch` are the only
-commands that touch the network, everything else works fine with no token
-set as long as a store already exists.
+personal access token from `FIGMA_TOKEN`. Since `pull` and `serve`'s own
+poll loop are the only things that touch the network, everything else
+works fine with no token set as long as a store already exists.
 
 ## How sync works
 
-`watch` polls the cheap `GET /v1/files/:key/meta` endpoint (Tier 3) every
-interval and only spends a Tier-1 `GET /v1/files/:key` fetch — the
-expensive, rate-limited call — when the file's content-modification
-watermark actually changes. Every fetch, whether from `pull` or `watch`,
-flows through fold's `KeyedStream` upsert-diff: re-syncing a byte-identical
-node is a no-op through the whole pipeline (zero graph churn, zero index
-writes), so a spurious trigger or a repeated `pull` costs one Tier-1 fetch
-and nothing else. Since the November 2025 rate-limit overhaul, file
-endpoints are capped around **10 requests/min on the free (Starter)
-plan**, and there is no delta API — this polling design is what makes
-that budget workable for an agent that wants to treat the file as live.
-The Tier-3 meta poll itself is capped around **50 requests/min on
-Starter**, well above any sane `--interval`.
+`figmog serve`'s built-in poll loop polls the cheap `GET
+/v1/files/:key/meta` endpoint (Tier 3) every `--interval` and only spends a
+Tier-1 `GET /v1/files/:key` fetch — the expensive, rate-limited call — when
+the file's content-modification watermark actually changes. Every fetch,
+whether from `pull` or that poll loop, flows through fold's `KeyedStream`
+upsert-diff: re-syncing a byte-identical node is a no-op through the whole
+pipeline (zero graph churn, zero index writes), so a spurious trigger or a
+repeated `pull` costs one Tier-1 fetch and nothing else. Since the
+November 2025 rate-limit overhaul, file endpoints are capped around **10
+requests/min on the free (Starter) plan**, and there is no delta API —
+this polling design is what makes that budget workable for an agent that
+wants to treat the file as live. The Tier-3 meta poll itself is capped
+around **50 requests/min on Starter**, well above any sane `--interval`.
 
 ## Use from agents (MCP)
 
 **figmog is the only Figma MCP an agent needs to connect.** `figmog serve`
-is one process — fjall is single-writer, so a standalone MCP server would
-fight `figmog watch` for the store lock — that owns the mirror, polls for
-changes exactly like `watch`, and (unless `--no-upstream`) also attaches
+is one process — fjall is single-writer, so a second writer would fight it
+for the store lock — that owns the mirror, polls for changes itself, and
+(unless `--no-upstream`) also attaches
 Figma's native desktop MCP server as a **cached proxy**: `tools/list`
 merges figmog's 19 local `figmog_*` tools with every tool the desktop
 server advertises, verbatim, so an agent gets one server, one connection,
@@ -99,19 +100,20 @@ needed):
 $ claude mcp add figmog -- /absolute/path/to/clog/target/debug/figmog serve --db .figmog/<key>/db --no-watch
 ```
 
-`--interval N` (default 10s) controls the poll cadence, same as `watch`.
+`--interval N` (default 10s) controls the poll cadence of `serve`'s
+built-in poll loop.
 
 **Single-writer constraint:** because fjall allows only one open handle per
-store, `figmog serve` (like `figmog watch`) holds an exclusive lock on its
-`--db` for as long as it runs. A CLI read against the *same* store while
-`serve` is up — `figmog status`, `figmog search`, `figmog call
-figmog_status`, and any other command that opens the store — fails fast
-with a clean `store is locked` error rather than a raw panic; drive the
-running server through its own MCP tool calls instead, or stop `serve`
-first. (`figmog tools` never opens the store, so it works fine even while
-`serve` is running.) The same applies to `serve`/`watch` itself: starting
-a second `figmog serve` or `figmog watch` against a store one of them
-already owns fails with the same clean message rather than a raw panic.
+store, `figmog serve` holds an exclusive lock on its `--db` for as long as
+it runs. A CLI read against the *same* store while `serve` is up —
+`figmog status`, `figmog search`, `figmog call figmog_status`, and any
+other command that opens the store — fails fast with a clean `store is
+locked` error rather than a raw panic; drive the running server through
+its own MCP tool calls instead, or stop `serve` first. (`figmog tools`
+never opens the store, so it works fine even while `serve` is running.)
+The same applies to `serve` itself: starting a second `figmog serve`
+against a store one of them already owns fails with the same clean
+message rather than a raw panic.
 
 ### Multiple files
 
@@ -151,16 +153,15 @@ simply ignored — the desktop server has no concept of "which file", so
 `get_code`/`get_design_context`/etc. always answer for whatever file is
 open in the Figma app, independent of any mirror `figmog serve` manages.
 
-**Accepted divergence:** `.figmog/current` — the file `pull`/`watch`/plain
-`figmog serve <file>` remember so later CLI commands can drop the file
-argument — is only refreshed by a startup pull that actually *ran*. A
-startup file whose store is already populated (including every
-`--no-watch` invocation, which never pulls at startup at all) leaves
-`.figmog/current` untouched; only a genuine network pull — the initial
-watch-mode pull against an empty store, or a later watch-tick pull —
-writes it.
+**Accepted divergence:** `.figmog/current` — the file `pull`/plain `figmog
+serve <file>` remember so later CLI commands can drop the file argument —
+is only refreshed by a startup pull that actually *ran*. A startup file
+whose store is already populated (including every `--no-watch` invocation,
+which never pulls at startup at all) leaves `.figmog/current` untouched;
+only a genuine network pull — the initial pull against an empty store, or
+a later poll-tick pull — writes it.
 
-CLI commands (`pull`, `watch`, `status`, and the rest) are unchanged and
+CLI commands (`pull`, `status`, and the rest) are unchanged and
 still address exactly one file via `--db`/`.figmog/current` — multi-file
 addressing is a `serve` capability only (spec §14 non-goal: no CLI
 multi-file addressing, no cross-file queries, no idle-session eviction —
@@ -357,187 +358,6 @@ call's output into it by hand. Figma's *remote* MCP server (as opposed to
 the local desktop one figmog proxies) caps Starter users at 6 tool calls
 a *month* and isn't something figmog talks to at all.
 
-## Demo: load-testing the server
-
-`figmog bench` makes the value proposition measurable without needing a
-real Figma file or token — one self-contained command:
-
-```console
-$ cargo run --release -p figmog -- bench
-```
-
-It runs four phases against a fresh temp store (cleaned up afterward
-unless `--keep`), all `Instant`-timed:
-
-1. **Corpus** — a deterministic synthetic Figma file (`--nodes`, default
-   10000): pages of auto-layout frames, TEXT nodes drawn from a fixed
-   64-word pool (so BM25 has real queries), a "Button" `COMPONENT_SET`
-   with variants and INSTANCE nodes referencing them, fill/text styles,
-   and `boundVariables` bindings. A seeded LCG makes it byte-identical
-   across runs of the same `--nodes` — no wall-clock, no `rand` dependency.
-2. **Cold sync** — `flatten` + `sync` the corpus into the temp store via
-   the library (not a subprocess).
-3. **No-churn re-pull** — `sync` the identical corpus again and assert in
-   code that churn is zero: the engine's headline invariant, timed.
-4. **Serve load** — spawn the real `figmog serve --no-upstream --no-watch`
-   binary and drive it over its actual stdio pipe with `--calls` (default
-   5000) tool calls in a fixed rotating mix (`figmog_search`,
-   `figmog_node`, `figmog_where`, `figmog_stats`, `figmog_tree`,
-   `figmog_instances`) — every parameter (search words, node ids, the
-   instances target) is *derived* from the corpus's own flattened
-   records, not hardcoded. Sequential over one pipe, matching the
-   server's real single-threaded loop, so the numbers are honest.
-
-Sample output (this machine: Apple M4, 16GB, dev profile — `cargo run -p
-figmog -- bench --nodes 10000 --calls 5000`; dev profile is `opt-level =
-3` in this workspace, so the numbers are respectable even without
-`--release`):
-
-```
-corpus  [synthetic]  10000 nodes, 2391449 bytes, 44.7ms
-cold sync    37.3ms flatten + 98.9ms sync, 10005 records (101140 records/s)
-re-pull      7.0ms, churn zero: true
-
-tool                  calls   p50 (ms)   p95 (ms)   p99 (ms)   max (ms)
-figmog_search           834      0.399      0.531      0.911      3.654
-figmog_node             834      0.043      0.058      0.152      8.374
-figmog_where            833     15.302     17.161     25.223     48.124
-figmog_stats            833     24.089     27.427     47.298    160.400
-figmog_tree             833      3.971      5.014      9.264     20.122
-figmog_instances        833      0.749      0.903      1.647      4.295
-
-figmog served 5000 queries in 38.4s (130 req/s). Figma's Tier-1 API budget on a free plan: ~10 file requests per MINUTE.
-```
-
-(`figmog_node` — an indexed point lookup — is the fastest tool by a wide
-margin; `figmog_where`/`figmog_stats` scan every node and are
-correspondingly slower, but still complete a 5000-call load test in
-under 40 seconds against a 10000-node file. All of it is local: zero
-Figma API calls, zero rate-limit exposure.)
-
-**Against a real file** (`figmog bench <file-url-or-key>`, needs
-`FIGMA_TOKEN`): the corpus becomes the real file — fetched once (exactly
-one Tier-1 call, plus the same opportunistic Enterprise `variables_local`
-call `pull` makes), reused in memory for the re-pull phase (no second
-fetch) — and the load test's query mix derives its parameters from
-whatever's actually in that file (falling back gracefully, e.g. dropping
-`figmog_instances` from the mix with a stderr note if the file has no
-components). Unless `--skip-api`, a fifth phase follows the serve load:
-`--api-calls` (default 5) sequential `GET /v1/files/:key/nodes?ids=`
-calls — Figma's native equivalent of `figmog_node` — timed the same way,
-plus one `GET /meta` call for reference, so the report can show
-`figmog_node` p50 next to the real API's p50 side by side, with a
-speedup factor and the budget math (how long the same `--calls` load
-test would take at Figma's ~10 Tier-1 requests/minute). **This spends
-real rate-limit budget**: 1 file fetch + 1 opportunistic
-`variables_local` + `K` `/nodes` calls + 1 `/meta` call — the report
-states every call it made; a 429 mid-phase is recorded (with its
-`Retry-After`) and ends the phase gracefully rather than failing the
-whole bench.
-
-### Interactive mode (`--interactive`)
-
-`figmog bench [file] --interactive` runs the same setup (corpus/real file
-→ cold sync → no-churn re-pull → serve child spawn) and then, instead of
-the automated load/API phases, drops into a REPL so requests are visible
-as they fire — one aligned line per call: sequence number, tool, arg
-digest, latency, and a result digest. Colors (green under 10ms, yellow
-under 100ms, red above; errors always red) are raw ANSI, emitted only
-when stdout is a real terminal — piped/non-TTY output (CI, this README's
-transcripts) is always plain text.
-
-| command | does |
-| --- | --- |
-| `search <words…>` | BM25 search over layer names/text |
-| `node <id> [children]` | full node JSON |
-| `tree [id] [depth]` | subtree outline |
-| `find <TYPE> [page]` | nodes by Figma node type |
-| `where <pointer> [value]` | nodes matching an RFC 6901 pointer (`value` parsed as JSON, falling back to a bare string) |
-| `stats` | node counts, totals, max depth |
-| `path <id>` | ancestor chain to a node |
-| `text [page]` | every TEXT node's characters |
-| `at <x> <y>` | nodes containing a point |
-| `instances <target>` | instances of a component |
-| `components` | design-system inventory |
-| `styles [type]` | styles with usage counts |
-| `uses <id>` | nodes using a style/variable id |
-| `vars [id]` | variables |
-| `pages` | list pages |
-| `status` | file name/version/node count |
-| `run <N>` | fire N requests of the derived mixed workload, streaming each line live, then a burst percentile table |
-| `report` | cumulative per-tool percentiles for everything fired this session |
-| `api node <id>` / `api meta` | real-file mode only — one live Figma API call (`/nodes` or `/meta`), timed the same way and labeled with the API cost it spent; a 429 prints its `Retry-After` in red and the REPL keeps going |
-| `call <tool> <json-args>` | raw escape hatch (works for proxied tools too, when an upstream is attached) |
-| `help` | this table |
-| `quit` | exit cleanly (EOF also works — the serve child is always reaped, never left a zombie) |
-
-Sample transcript (same machine as above: Apple M4, 16GB, `cargo run
---release -p figmog -- bench --nodes 10000 --interactive`, piped
-non-interactively so this is plain text — a real terminal shows it in
-color):
-
-```console
-$ printf 'search garden\nnode 1:1\nrun 8\nreport\nquit\n' \
-  | cargo run --release -p figmog -- bench --nodes 10000 --interactive
-corpus  [synthetic]  10000 nodes, 2391449 bytes, 54.7ms
-cold sync    36.9ms flatten + 139.2ms sync, 10005 records (71850 records/s)
-re-pull      6.3ms, churn zero: true
-
-figmog bench --interactive — type `help` for commands, `quit` to exit.
-#   1  figmog_search      {"query":"garden"}                   0.07ms  0 hits
-#   2  figmog_node        {"id":"1:1"}                         0.08ms  Button
-#   3  figmog_search      {"query":"Nav"}                      0.42ms  10 hits
-#   4  figmog_node        {"id":"25:177"}                      0.04ms  Slider Body Banner Table Toolbar Button
-#   5  figmog_where       {"equals":"VERTICAL","pointer":"    13.51ms  1809 hits
-#   6  figmog_stats       {}                                  20.49ms  ok
-#   7  figmog_tree        {"depth":2}                          3.37ms  Document
-#   8  figmog_instances   {"target":"Button"}                  0.66ms  407 hits
-#   9  figmog_search      {"query":"12"}                       0.04ms  1 hits
-#  10  figmog_node        {"id":"37:78"}                       0.05ms  Grid Field Preview Progress Divider Toggle Row Header
-
-tool                  calls   p50 (ms)   p95 (ms)   p99 (ms)   max (ms)
-figmog_search             2      0.040      0.040      0.040      0.422
-figmog_node               2      0.041      0.041      0.041      0.051
-figmog_where              1     13.508     13.508     13.508     13.508
-figmog_stats              1     20.490     20.490     20.490     20.490
-figmog_tree               1      3.369      3.369      3.369      3.369
-figmog_instances          1      0.656      0.656      0.656      0.656
-
-tool                  calls   p50 (ms)   p95 (ms)   p99 (ms)   max (ms)
-figmog_search             3      0.071      0.071      0.071      0.422
-figmog_node               3      0.051      0.051      0.051      0.076
-figmog_where              1     13.508     13.508     13.508     13.508
-figmog_stats              1     20.490     20.490     20.490     20.490
-figmog_tree               1      3.369      3.369      3.369      3.369
-figmog_instances          1      0.656      0.656      0.656      0.656
-```
-
-`search garden`/`node 1:1` are the first two typed commands; `run 8`
-streams 8 requests of the derived mixed workload live (lines 3-10) then
-prints its own burst table; `report` prints the session's cumulative
-table (same six tools, now 3 `figmog_search`/3 `figmog_node` calls
-counted). `quit` closes stdin to the serve child and waits for it to
-exit — no zombie process left behind.
-
-**Against a real file** (`figmog bench <file> --interactive`, needs
-`FIGMA_TOKEN`), the `api node <id>` / `api meta` commands become the
-demo's centerpiece: firing one alongside a `node <id>` for the same id
-puts figmog's local read and Figma's real Tier-1 API call side by side,
-live. Illustrative shape (not a captured run — no token in this repo's
-CI/dev environment — but the format is exactly what `format_latency_line`
-and the `api node` line print):
-
-```
-#  11  figmog_node        {"id":"1:234"}                       0.05ms  Icon/Star
-#  12  API node           1:234                              ~400.00ms  ok  (spent 1 Tier-1 call)
-```
-
-figmog's read is a local, indexed point lookup (sub-millisecond); the API
-call pays a real network round trip — that gap, live, is the whole
-pitch. Every `api …` call spends real rate-limit budget (Figma's Tier-1 files
-allow ~10/minute) — the line's `(spent …)` note says exactly what it
-cost, and a 429 prints its `Retry-After` in red instead of exiting.
-
 ## Manual live check
 
 Not run in CI (needs a real `FIGMA_TOKEN` and a real file); this is how to
@@ -572,9 +392,10 @@ the mirrored file is.
   consumer node's resolved properties (e.g. a text style's `TypeStyle`
   from a TEXT node that uses it) — if a style currently has no consumers,
   it has no derivable value.
-- **Change detection is polling, not webhooks** — `watch` polls the cheap
-  `last_touched_at` metadata field on an interval; Figma's `FILE_UPDATE`
-  webhook is unavailable on the free plan and debounced up to 30 minutes
+- **Change detection is polling, not webhooks** — `figmog serve`'s poll
+  loop polls the cheap `last_touched_at` metadata field on an interval;
+  Figma's `FILE_UPDATE` webhook is unavailable on the free plan and
+  debounced up to 30 minutes
   even where it exists, so polling a cheap Tier-3 endpoint is both
   simpler and faster.
 - **Instance overrides beyond the serialized subtree are not resolved** —
