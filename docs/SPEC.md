@@ -115,7 +115,7 @@ detector. No `HashMap` iteration ever reaches an output boundary.
 
 ## 4. Pipeline and sinks
 
-`store::figmog_pipeline!()` wires the flattened records into eight
+`store::figmog_pipeline!()` wires the flattened records into 14
 `fold` terminal sinks, keyed off `store.rs`'s pure branch functions
 (`node_only`, `child_edge`, `text_doc`, `instance_edge`, `style_edges`,
 `variable_edges`, `type_edge`, plus one `rec_branch!`-generated filter per
