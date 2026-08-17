@@ -304,7 +304,7 @@ pub(crate) fn open_session_at(
     let proxy_cache: ProxyCacheFn = {
         let st = st.clone();
         Box::new(move |upstream, name, args| {
-            let args_canonical = crate::proxy::canonical_args(args);
+            let args_canonical = crate::proxy::canonical_args(args)?;
             let version_and_hit = if crate::proxy::is_cacheable(name, args) {
                 st.borrow().rtx(|(_, _, _, _, _, _, meta, cache)| {
                     let version = meta.get(&0).map(|m| m.version.clone());

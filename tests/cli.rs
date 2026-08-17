@@ -516,6 +516,74 @@ fn cli_pull_evicts_stale_cache_rows_on_version_change() {
     );
 }
 
+/// I-1: `figmog`'s stdout write must tolerate a reader that closes
+/// mid-write — piped into `head`, a killed consumer, a closed terminal —
+/// with a clean exit 0, not a `println!` panic and not the ordinary
+/// exit-1 error path (the write was never at fault; its consumer left).
+/// Reproduced by asking `figmog get` for one node whose raw JSON carries a
+/// ~4MB `characters` string with no embedded newlines — comfortably
+/// larger than any platform's default pipe buffer (16KB-1MB), so the
+/// write can't complete in one buffered burst before a reader has a
+/// chance to go away mid-stream. Manual `std::process::Command` (not
+/// `assert_cmd`, which reads to completion) so the read end can be
+/// dropped after only a few bytes while the child almost certainly still
+/// has megabytes left to write.
+#[test]
+fn write_json_survives_a_reader_that_closes_mid_write() {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut doc = common::fixture_v1();
+    // Node 1:2 ("Title", a TEXT node under Page 1 -> Hero -> Title).
+    // `figmog get` dumps a node's raw JSON verbatim, so a huge string
+    // value on it becomes one long output line with no embedded newline —
+    // forcing a single sustained write rather than many small,
+    // line-buffered ones. A made-up field name (not `characters`) so it
+    // never reaches the BM25 text index — a single non-whitespace "word"
+    // that size would itself blow past the store's own key-length limit
+    // there; this way it's purely payload, round-tripped verbatim through
+    // `raw` untouched by any pipeline branch.
+    doc["document"]["children"][0]["children"][0]["children"][0]["hugePayload"] =
+        serde_json::Value::String("x".repeat(4_000_000));
+    let response = dir.path().join("resp.json");
+    std::fs::write(&response, serde_json::to_string(&doc).unwrap()).unwrap();
+    let db = dir.path().join("db");
+
+    Command::cargo_bin("figmog")
+        .unwrap()
+        .args([
+            "pull",
+            "--from-file",
+            response.to_str().unwrap(),
+            "--db",
+            db.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_figmog"))
+        .args(["get", "1:2", "--db", db.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let mut stdout = child.stdout.take().unwrap();
+    let mut prefix = [0u8; 64];
+    stdout
+        .read_exact(&mut prefix)
+        .expect("child should have written at least a small prefix");
+    drop(stdout); // close our read end — the child's next write should EPIPE
+
+    let status = child.wait().unwrap();
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a vanished reader must be a clean exit 0, not a panic (101) or an error exit"
+    );
+}
+
 /// JSON is the only output mode now (spec §4): the global `--json` flag no
 /// longer exists, so passing it must fail clap's own argument parsing
 /// (unknown flag) rather than being silently accepted.

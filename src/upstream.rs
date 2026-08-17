@@ -10,9 +10,13 @@
 //! URL. Registry merge, routing, and caching are Task 8's job (`serve.rs`).
 //!
 //! [`UpstreamMcp`] is the seam: [`HttpUpstream`] is the real client, and
-//! [`FakeUpstream`] is a scripted double other test suites in this crate
-//! (e.g. `tests/serve.rs`) can drive without a live desktop app.
+//! [`FakeUpstream`] is a scripted, `#[cfg(test)]`-only double this crate's
+//! own unit tests (`proxy.rs`, `serve.rs`) drive without a live desktop
+//! app. `tests/serve.rs`, a separate integration-test binary, rolls its
+//! own in-process HTTP fake instead — it can't reach this module at all
+//! (`pub(crate)`).
 
+#[cfg(test)]
 use std::collections::VecDeque;
 use std::time::Duration;
 
@@ -279,20 +283,26 @@ fn parse_sse_last_event(body: &str) -> Result<Value, UpstreamError> {
 /// test assert whether the upstream was hit at all (e.g. a cache-hit test
 /// asserting the fake was *not* called a second time).
 ///
-/// `pub` (not `#[cfg(test)]`) so other test binaries in this crate, such
-/// as `tests/serve.rs`, can construct and script it directly.
-pub struct FakeUpstream {
-    pub tools: Vec<Value>,
-    pub results: VecDeque<Result<Value, UpstreamError>>,
-    pub call_count: usize,
-    pub initialize_calls: usize,
+/// `#[cfg(test)]`, not merely `pub(crate)`: every driver of this type is a
+/// `#[cfg(test)] mod tests` block inside this crate itself (`proxy.rs`,
+/// `serve.rs`) — `tests/serve.rs` is a *separate* integration-test binary
+/// that links `figmog` as an external crate (its `serve_e2e_*`-named tests
+/// drive an in-process HTTP fake it rolls itself, not this type) and
+/// couldn't reach a `pub(crate)` item regardless.
+#[cfg(test)]
+pub(crate) struct FakeUpstream {
+    pub(crate) tools: Vec<Value>,
+    pub(crate) results: VecDeque<Result<Value, UpstreamError>>,
+    pub(crate) call_count: usize,
+    pub(crate) initialize_calls: usize,
 }
 
+#[cfg(test)]
 impl FakeUpstream {
     /// A fake exposing `tools` from `tools/list`, with no scripted call
     /// results yet — push some with [`push_result`](Self::push_result)
     /// before driving any [`call`](UpstreamMcp::call).
-    pub fn new(tools: Vec<Value>) -> Self {
+    pub(crate) fn new(tools: Vec<Value>) -> Self {
         FakeUpstream {
             tools,
             results: VecDeque::new(),
@@ -302,11 +312,12 @@ impl FakeUpstream {
     }
 
     /// Queue the result the next [`call()`](UpstreamMcp::call) returns.
-    pub fn push_result(&mut self, result: Result<Value, UpstreamError>) {
+    pub(crate) fn push_result(&mut self, result: Result<Value, UpstreamError>) {
         self.results.push_back(result);
     }
 }
 
+#[cfg(test)]
 impl UpstreamMcp for FakeUpstream {
     fn initialize(&mut self) -> Result<(), UpstreamError> {
         self.initialize_calls += 1;

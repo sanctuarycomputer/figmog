@@ -13,8 +13,11 @@ pub(crate) const BACKOFF_CAP: Duration = Duration::from_secs(300);
 pub enum Tick {
     /// File unchanged since the last seen `last_touched_at`.
     Unchanged,
-    /// File changed — caller should pull. Carries the new watermark.
-    Changed { last_touched_at: String },
+    /// File changed — caller should pull. The new watermark is already
+    /// absorbed into `self.last_seen`; every caller (`serve.rs`'s
+    /// `watch_tick`) just matches `Changed { .. }` and re-pulls from the
+    /// store's own state, so this variant carries no payload.
+    Changed,
     /// Transient failure or rate limit — caller should sleep `after`
     /// (instead of its normal interval), then tick again.
     Wait { after: Duration },
@@ -45,10 +48,8 @@ impl Watcher {
                 if self.last_seen.as_deref() == Some(meta.last_touched_at.as_str()) {
                     Tick::Unchanged
                 } else {
-                    self.last_seen = Some(meta.last_touched_at.clone());
-                    Tick::Changed {
-                        last_touched_at: meta.last_touched_at,
-                    }
+                    self.last_seen = Some(meta.last_touched_at);
+                    Tick::Changed
                 }
             }
             Err(ApiError::RateLimited { retry_after }) => Tick::Wait { after: retry_after },
@@ -97,21 +98,22 @@ mod tests {
 
     #[test]
     fn unchanged_then_changed() {
-        let api = Script::new(vec![meta("t1"), meta("t1"), meta("t2")]);
+        let api = Script::new(vec![meta("t1"), meta("t1"), meta("t2"), meta("t2")]);
         let mut w = Watcher::new(Some("t1".into()));
         assert!(matches!(w.tick(&api, "k"), Tick::Unchanged));
         assert!(matches!(w.tick(&api, "k"), Tick::Unchanged));
-        match w.tick(&api, "k") {
-            Tick::Changed { last_touched_at } => assert_eq!(last_touched_at, "t2"),
-            other => panic!("expected Changed, got {other:?}"),
-        }
+        assert!(matches!(w.tick(&api, "k"), Tick::Changed));
+        // The watermark that advanced internally on the `Changed` tick
+        // ("t2") is now what a repeat sees as unchanged — `Tick::Changed`
+        // carries no payload, so this is how the update is observed.
+        assert!(matches!(w.tick(&api, "k"), Tick::Unchanged));
     }
 
     #[test]
     fn first_tick_with_no_history_is_changed() {
         let api = Script::new(vec![meta("t1")]);
         let mut w = Watcher::new(None);
-        assert!(matches!(w.tick(&api, "k"), Tick::Changed { .. }));
+        assert!(matches!(w.tick(&api, "k"), Tick::Changed));
     }
 
     #[test]

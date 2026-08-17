@@ -49,29 +49,37 @@ pub(crate) fn is_cacheable(name: &str, args: &Value) -> bool {
 /// `serde_json::Value` objects are backed by a `BTreeMap` (this crate never
 /// enables the `preserve_order` feature), so `to_string` already yields
 /// sorted-key, deterministic output — no extra normalization needed.
-pub(crate) fn canonical_args(args: &Value) -> String {
-    serde_json::to_string(args).unwrap_or_default()
+/// Propagates a serialize failure rather than collapsing it to `""`: two
+/// *different* calls that both failed to serialize would otherwise share
+/// one cache key/lookup (`""`), letting one tool's cached response answer
+/// another's request.
+pub(crate) fn canonical_args(args: &Value) -> Result<String, String> {
+    serde_json::to_string(args).map_err(|e| e.to_string())
 }
 
 /// `tools/list` = the local `figmog_*` registry followed by every upstream
 /// tool verbatim (name/inputSchema passed through, description prefixed
 /// `"[via Figma desktop] "`). Returns the merged list plus the names of any
-/// upstream tools dropped for colliding with the local registry — either the
+/// upstream tools dropped for colliding with the local registry OR with an
+/// upstream tool already accepted earlier in this same call — either the
 /// `figmog_*` namespace (the namespace rule makes this impossible for
 /// figmog's own registry, but a live desktop server's tool list is outside
-/// figmog's control) or, defensively, an exact match against a current local
-/// tool's name even without the prefix — the caller logs the drops.
+/// figmog's control), a defensive exact match against a current local
+/// tool's name even without the prefix, or two upstream entries sharing a
+/// name (a malformed/duplicated upstream tool list must not produce two
+/// `ToolDef`s of the same name in the merged registry) — the caller logs
+/// the drops.
 pub(crate) fn merge_registry(
     mut local: Vec<ToolDef>,
     upstream_tools: &[Value],
 ) -> (Vec<ToolDef>, Vec<String>) {
-    let local_names: std::collections::BTreeSet<&str> = local.iter().map(|t| t.name).collect();
+    let mut seen_names: std::collections::BTreeSet<&str> = local.iter().map(|t| t.name).collect();
     let mut dropped = Vec::new();
     for tool in upstream_tools {
         let Some(name) = tool.get("name").and_then(Value::as_str) else {
             continue;
         };
-        if is_local_tool(name) || local_names.contains(name) {
+        if is_local_tool(name) || seen_names.contains(name) {
             dropped.push(name.to_string());
             continue;
         }
@@ -87,8 +95,10 @@ pub(crate) fn merge_registry(
         // (no mid-session re-probe in v3 — spec §12), and figmog serves for
         // the life of the process: leaking these few dozen strings to get
         // the `&'static str` `ToolDef` needs is bounded and never repeats.
+        let leaked_name: &'static str = Box::leak(name.to_string().into_boxed_str());
+        seen_names.insert(leaked_name);
         local.push(ToolDef {
-            name: Box::leak(name.to_string().into_boxed_str()),
+            name: leaked_name,
             description: Box::leak(format!("[via Figma desktop] {description}").into_boxed_str()),
             input_schema,
         });
@@ -130,7 +140,7 @@ pub(crate) fn proxy_call<U: UpstreamMcp, P: Push<Keyed<Id, Rec>>>(
         // identical call gets a fresh attempt instead of a stuck failure.
         let is_error = result.get("isError") == Some(&Value::Bool(true));
         if !is_error && let Some(version) = &version {
-            let args_canonical = canonical_args(args);
+            let args_canonical = canonical_args(args)?;
             cache::store(st, name, &args_canonical, version, &result)?;
         }
         return Ok((result, false));
@@ -246,6 +256,30 @@ mod tests {
         assert_eq!(merged[1].input_schema, json!({"type": "object"}));
     }
 
+    #[test]
+    fn merge_registry_drops_a_second_upstream_tool_with_a_duplicate_name() {
+        // Two upstream entries sharing a name (a malformed/duplicated
+        // upstream tool list) must still only produce one `ToolDef` in the
+        // merged registry — the second is dropped, not appended as a
+        // duplicate.
+        let local = vec![local_tool("figmog_status")];
+        let upstream = vec![
+            json!({"name": "get_code", "description": "first"}),
+            json!({"name": "get_code", "description": "second"}),
+        ];
+        let (merged, dropped) = merge_registry(local, &upstream);
+        assert_eq!(dropped, vec!["get_code".to_string()]);
+        assert_eq!(merged.iter().filter(|t| t.name == "get_code").count(), 1);
+        assert_eq!(
+            merged
+                .iter()
+                .find(|t| t.name == "get_code")
+                .unwrap()
+                .description,
+            "[via Figma desktop] first"
+        );
+    }
+
     // ---- proxy_call routing ----
 
     #[test]
@@ -295,7 +329,7 @@ mod tests {
             cache::lookup(
                 &cache,
                 "get_code",
-                &canonical_args(&json!({"nodeId": "1:2"})),
+                &canonical_args(&json!({"nodeId": "1:2"})).unwrap(),
                 "100",
             )
         });
@@ -373,7 +407,7 @@ mod tests {
             cache::lookup(
                 &cache,
                 "get_code",
-                &canonical_args(&json!({"nodeId": "1:2"})),
+                &canonical_args(&json!({"nodeId": "1:2"})).unwrap(),
                 "100",
             )
         });

@@ -2,6 +2,7 @@
 //! the local store and read one snapshot.
 
 use std::collections::BTreeSet;
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -176,17 +177,46 @@ enum Cmd {
     },
 }
 
+/// Sentinel [`dispatch`]/[`write_json`] error string meaning "stdout
+/// closed mid-write, not a command failure" (the reader vanished — piped
+/// into `head`, a killed consumer, …). Never printed: `run` recognizes it
+/// and maps it to a silent, clean exit 0 instead of the ordinary exit-1
+/// `{"error": ...}` path, the same "vanished client = clean shutdown"
+/// stance `serve.rs`'s stdout frame writes take for the MCP loop.
+const STDOUT_CLOSED: &str = "\0figmog:stdout-closed";
+
 /// Parse `argv`, dispatch, and return the process exit code (0 on success,
-/// 1 with `{"error": <message>}` on stderr otherwise).
+/// 1 with `{"error": <message>}` on stderr otherwise — except a closed
+/// stdout (the internal `STDOUT_CLOSED` sentinel), which is a silent 0).
 pub fn run() -> i32 {
     let cli = Cli::parse();
     match dispatch(cli) {
         Ok(()) => 0,
+        Err(e) if e == STDOUT_CLOSED => 0,
         Err(e) => {
             eprintln!("{}", json!({"error": e}));
             1
         }
     }
+}
+
+/// The one place every command writes its JSON result to stdout (spec §4:
+/// JSON is the CLI's only output mode). `println!`/`print!` panic on a
+/// write error (their internal `.expect`) — and the overwhelmingly likely
+/// error here is the reader having gone away (piped into `head`, a killed
+/// consumer, a closed terminal), not a real figmog fault. Writes manually
+/// so that case becomes [`STDOUT_CLOSED`] instead: a clean, expected exit
+/// 0 rather than a panic or a broken-pipe error message the operator can't
+/// act on. Serialization failure (a genuine bug — `v` came from `serde_json`
+/// itself, so this should never happen for real) stays a normal exit-1
+/// error.
+fn write_json(v: &Value) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(v).map_err(|e| e.to_string())?;
+    let mut stdout = std::io::stdout();
+    if writeln!(stdout, "{text}").is_err() || stdout.flush().is_err() {
+        return Err(STDOUT_CLOSED.to_string());
+    }
+    Ok(())
 }
 
 fn dispatch(cli: Cli) -> Result<(), String> {
@@ -418,38 +448,65 @@ const STORE_LOCKED_MSG: &str = "store is locked — is `figmog serve` running? Q
 /// `open_store!` (via `fold::stream::Stream::new`) panics rather than
 /// returning a `Result` when the underlying store can't be opened — most
 /// commonly because another process (`figmog serve`) already holds fjall's
-/// single-writer lock (`fjall::Error::Locked`). fold
-/// itself stays untouched (its panic-on-open contract is intentional and
-/// shared by `wtx`'s own rollback-on-panic path); this wrapper is figmog's
-/// layer, catching that one specific panic and translating it into a clean
-/// exit-1 error instead. Any *other* panic (a genuine bug — not lock
-/// contention) is re-raised unchanged via `resume_unwind` so it isn't
-/// silently swallowed.
+/// single-writer lock (`fjall::Error::Locked`). fold itself stays untouched
+/// (its panic-on-open contract is intentional and shared by `wtx`'s own
+/// rollback-on-panic path); this wrapper is figmog's layer, catching that
+/// one specific panic and translating it into a clean exit-1 `Err` instead.
 ///
-/// Deliberately does **not** touch the global panic hook: swapping it out
-/// for the call's duration would suppress *every* panic's trace, including
-/// non-lock ones that get re-raised — turning a genuine bug (corrupt
-/// store, disk error) into a silent exit 101 with no stderr output at all,
-/// which is worse than not catching anything. The default hook stays
-/// active throughout, so a lock panic still prints fold's raw trace before
-/// this function's friendly `STORE_LOCKED_MSG` follows (slightly noisy,
-/// but honest); swapping a process-global hook around a call is also
-/// inherently racy against other threads, which this avoids entirely.
+/// **stderr is JSON on every path — including a panic.** The default panic
+/// hook is swapped for a no-op for the duration of the call (restored
+/// immediately after, on both outcomes) so a lock panic can never print
+/// fold's raw `thread 'main' panicked… ` banner ahead of our own JSON line;
+/// an earlier version left the hook active specifically to preserve that
+/// banner, which broke the "stderr always parses as one JSON object"
+/// contract every other error path in this CLI honors. A *non*-lock panic
+/// (a genuine bug — corrupt store, disk error, anything unrelated to lock
+/// contention) is no longer re-raised via `resume_unwind`, since with the
+/// hook suppressed that would exit 101 with **no** stderr output at all —
+/// silently swallowing it is worse than the old raw-panic banner was.
+/// Instead its payload message is extracted (falling back to `"unknown
+/// panic"` for a non-string payload) and emitted as our own
+/// `{"error": "internal panic: ..."}` JSON line, then the process exits
+/// 101 directly (distinct from the ordinary exit-1 `Err` path, so a caller
+/// can still tell "this command failed" from "this command's process
+/// itself came apart"). One deliberate cost: this sacrifices Rust's
+/// backtrace — `RUST_BACKTRACE=1` has nothing to print through a
+/// suppressed hook — traded for a stderr contract every consumer (this
+/// CLI's own tests included) can rely on unconditionally.
 pub(crate) fn open_store_checked<T>(
     open: impl FnOnce() -> T + std::panic::UnwindSafe,
 ) -> Result<T, String> {
-    std::panic::catch_unwind(open).map_err(|payload| {
-        let msg = payload
-            .downcast_ref::<&str>()
-            .map(|s| s.to_string())
-            .or_else(|| payload.downcast_ref::<String>().cloned())
-            .unwrap_or_default();
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = std::panic::catch_unwind(open);
+    std::panic::set_hook(prev_hook);
+
+    result.map_err(|payload| {
+        let msg = panic_message(&*payload);
         if msg.contains("Locked") {
             STORE_LOCKED_MSG.to_string()
         } else {
-            std::panic::resume_unwind(payload)
+            eprintln!("{}", json!({"error": format!("internal panic: {msg}")}));
+            std::process::exit(101);
         }
     })
+}
+
+/// Best-effort text for a caught panic's payload: `&str`/`String` cover
+/// every panic this codebase (and fold) actually raises (`panic!`,
+/// `.expect(...)`, `.unwrap()`), falling back to `"unknown panic"` for
+/// anything else (a non-string payload, reachable in principle via
+/// `std::panic::panic_any`). Split out from [`open_store_checked`] so it's
+/// unit-testable without touching that function's `std::process::exit`
+/// path — which itself can't be exercised by an in-process test (calling
+/// it for real would tear down the whole `cargo test` binary, not just one
+/// test); that path is proven by inspection and the doc comment above.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string())
 }
 
 // ---- engine commands ----
@@ -586,11 +643,7 @@ pub(crate) fn do_pull(
 }
 
 fn print_churn(churn: &Churn) -> Result<(), String> {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(churn).map_err(|e| e.to_string())?
-    );
-    Ok(())
+    write_json(&serde_json::to_value(churn).map_err(|e| e.to_string())?)
 }
 
 /// How long a failed pull's caller (`figmog serve`'s sessions, via
@@ -630,11 +683,7 @@ fn cmd_import_variables(db: &Db, path: PathBuf) -> Result<(), String> {
         .iter()
         .filter(|(id, _)| matches!(id, Id::Variable(_)))
         .count();
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&json!({"imported": imported})).map_err(|e| e.to_string())?
-    );
-    Ok(())
+    write_json(&json!({"imported": imported}))
 }
 
 // ---- cached-proxy CLI parity: `figmog tools` / `figmog call` ----
@@ -684,11 +733,7 @@ fn cmd_tools(upstream_url: String, no_upstream: bool) -> Result<(), String> {
             })
         })
         .collect();
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&rows).map_err(|e| e.to_string())?
-    );
-    Ok(())
+    write_json(&Value::Array(rows))
 }
 
 /// `figmog call <tool> [--args json]`: invoke any tool by name through the
@@ -737,7 +782,7 @@ fn cmd_call(
         let up = upstream
             .as_mut()
             .ok_or_else(|| format!("upstream not attached: {tool}"))?;
-        let args_canonical = proxy::canonical_args(&args);
+        let args_canonical = proxy::canonical_args(&args)?;
         let version_and_hit = if proxy::is_cacheable(&tool, &args) {
             st.rtx(|(_, _, _, _, _, _, meta, cache)| {
                 let version = meta.get(&0).map(|m| m.version.clone());
@@ -766,12 +811,7 @@ fn cmd_call(
 /// propagates the error so `run`'s top-level handler emits `{"error": ...}`
 /// on stderr and exits 1, same as every other command.
 fn print_call_result(result: Result<Value, String>) -> Result<(), String> {
-    let v = result?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?
-    );
-    Ok(())
+    write_json(&result?)
 }
 
 // ---- core reads ----
@@ -782,11 +822,7 @@ fn print_call_result(result: Result<Value, String>) -> Result<(), String> {
 // ...}` on stderr with exit 1.
 
 fn print_value(v: &Value) -> Result<(), String> {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(v).map_err(|e| e.to_string())?
-    );
-    Ok(())
+    write_json(v)
 }
 
 fn cmd_status<R: Readable>(
@@ -990,19 +1026,22 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    /// Only the locked-store panic is translated; any other panic (a real
-    /// bug, not lock contention) must propagate unchanged rather than being
-    /// silently reworded into the locked-store message.
+    /// `panic_message` is what tells a lock panic (reworded to
+    /// `STORE_LOCKED_MSG`) apart from any other panic (emitted verbatim as
+    /// `internal panic: <msg>` and exit 101 — see `open_store_checked`'s
+    /// doc comment) — covering the `&str` and `String` payload shapes a
+    /// real `panic!`/`.unwrap()` produces, plus the `"unknown panic"`
+    /// fallback for a payload that's neither.
     #[test]
-    fn open_store_checked_reraises_non_lock_panics_unchanged() {
-        let outcome = std::panic::catch_unwind(|| open_store_checked(|| -> () { panic!("boom") }));
-        let payload = outcome.expect_err("non-lock panics must still panic");
-        let msg = payload
-            .downcast_ref::<&str>()
-            .map(|s| s.to_string())
-            .or_else(|| payload.downcast_ref::<String>().cloned())
-            .unwrap_or_default();
-        assert_eq!(msg, "boom");
+    fn panic_message_extracts_str_and_string_payloads_and_falls_back() {
+        let str_payload: Box<dyn std::any::Any + Send> = Box::new("boom");
+        assert_eq!(panic_message(&*str_payload), "boom");
+
+        let string_payload: Box<dyn std::any::Any + Send> = Box::new("boom".to_string());
+        assert_eq!(panic_message(&*string_payload), "boom");
+
+        let other_payload: Box<dyn std::any::Any + Send> = Box::new(42i32);
+        assert_eq!(panic_message(&*other_payload), "unknown panic");
     }
 
     #[test]

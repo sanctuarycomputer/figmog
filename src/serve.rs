@@ -387,7 +387,7 @@ fn watch_tick(
     match session.watcher.tick(&api, &key) {
         Tick::Unchanged => Instant::now() + deadline,
         Tick::Wait { after } => Instant::now() + after,
-        Tick::Changed { .. } => match sessions::do_pull(session, interval) {
+        Tick::Changed => match sessions::do_pull(session, interval) {
             Ok(_outcome) => {
                 refresh_current(manager, track_current, &key);
                 Instant::now() + deadline

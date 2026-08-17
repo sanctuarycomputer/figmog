@@ -325,11 +325,13 @@ fn serve_e2e_initialize_tools_list_and_tool_calls() {
 /// holding a fixture store, `figmog status --db <same>` in a second
 /// process) as an automated test.
 ///
-/// `open_store_checked` deliberately leaves the default panic hook active
-/// (see its doc comment in `cli.rs`), so fold's raw trace may legitimately
-/// appear on stderr *before* the friendly line — this only asserts the
-/// friendly message is present and the exit code is the clean 1, not that
-/// stderr is free of the word "panicked".
+/// `open_store_checked` (see its doc comment in `cli.rs`) suppresses the
+/// default panic hook for the call, so fold's raw `thread 'main'
+/// panicked… ` banner must never reach stderr at all — this test proves
+/// that directly by parsing the *entire* stderr buffer as one JSON object
+/// (`serde_json::from_slice`, not a substring `contains` check): any
+/// leaked banner text before or after the JSON line would make the whole
+/// buffer fail to parse.
 #[test]
 fn cli_read_against_a_store_serve_holds_fails_clean_not_with_a_panic() {
     let (_dir, db) = common::fixture_db();
@@ -364,10 +366,19 @@ fn cli_read_against_a_store_serve_holds_fails_clean_not_with_a_panic() {
         "expected a clean exit-1, not fold's raw panic exit (101); stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap_or_else(|e| {
+        panic!(
+            "stderr must be exactly one JSON object with no leaked panic banner \
+             (parse error: {e}); stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    let error = parsed["error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected an \"error\" string field, got: {parsed}"));
     assert!(
-        stderr.contains("store is locked"),
-        "expected the locked-store message, got: {stderr}"
+        error.contains("store is locked"),
+        "expected the locked-store message, got: {error}"
     );
 
     drop(stdin);
