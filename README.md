@@ -27,7 +27,7 @@ repo's own testing releases is a deliberate, separate decision.
 
 ### From a release binary
 
-Download the tarball for your platform from
+Download the tarball for your platform, plus `SHA256SUMS`, from
 [Releases](https://github.com/sanctuarycomputer/figmog/releases)
 (`figmog-<version>-<target>.tar.gz` — `aarch64-apple-darwin`,
 `x86_64-apple-darwin`, or `x86_64-unknown-linux-gnu`), then:
@@ -37,6 +37,17 @@ $ tar xzf figmog-<version>-<target>.tar.gz
 $ chmod +x figmog
 $ ./figmog --help
 ```
+
+**Verify the download (optional but recommended).** `SHA256SUMS`
+covers all three platform tarballs in a release; check the one you
+downloaded against it:
+
+```console
+$ shasum -a 256 -c SHA256SUMS --ignore-missing   # macOS
+$ sha256sum -c SHA256SUMS --ignore-missing        # Linux
+```
+
+Either should print `figmog-<version>-<target>.tar.gz: OK`.
 
 **Linux: glibc requirement.** The `x86_64-unknown-linux-gnu` binary is
 built on Ubuntu 24.04 and requires glibc ≥ 2.39; on older distros, build

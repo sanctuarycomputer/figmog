@@ -13,7 +13,7 @@ jobs:
           - target: aarch64-apple-darwin
             runner: macos-14
           - target: x86_64-apple-darwin
-            runner: macos-13
+            runner: macos-14
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
     runs-on: ${{ matrix.runner }}
@@ -69,5 +69,5 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             --prerelease \
             --title "$GITHUB_REF_NAME" \
-            --notes "Pre-release binaries for testing. See the README's Install section for platform tarballs, checksum verification, and the macOS quarantine note. figmog depends on fold via a pinned git rev; upstream bogkit currently ships with no license file, so broader redistribution beyond this repo's own testing releases is deferred until that clears (see README's License section)." \
+            --notes "Pre-release binaries for testing. See the README's Install section for platform tarballs, the SHA256SUMS verification snippet, and the macOS quarantine note. figmog depends on fold via a pinned git rev; upstream bogkit currently ships with no license file, so broader redistribution beyond this repo's own testing releases is deferred until that clears (see README's License section)." \
             *.tar.gz SHA256SUMS
