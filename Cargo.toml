@@ -1,3 +1,9 @@
+# Empty on purpose: this guards against Cargo silently treating figmog as a
+# member of some *enclosing* workspace when this repo is checked out nested
+# inside another Cargo project (e.g. a dev checkout under another crate's
+# tree) — an empty [workspace] table makes this crate its own workspace
+# root regardless of what's above it. Harmless as a standalone repo, where
+# there's nothing above it to guard against; kept for that scenario anyway.
 [workspace]
 
 [package]

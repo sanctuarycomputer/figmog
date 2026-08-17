@@ -325,7 +325,7 @@ fn serve_e2e_initialize_tools_list_and_tool_calls() {
 /// holding a fixture store, `figmog status --db <same>` in a second
 /// process) as an automated test.
 ///
-/// `open_store_checked` (see its doc comment in `cli.rs`) suppresses the
+/// `open_store_checked` (see its doc comment in `cli/mod.rs`) suppresses the
 /// default panic hook for the call, so fold's raw `thread 'main'
 /// panicked… ` banner must never reach stderr at all — this test proves
 /// that directly by parsing the *entire* stderr buffer as one JSON object

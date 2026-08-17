@@ -354,6 +354,70 @@ fn import_variables_upgrades_vars_to_authoritative() {
     assert_eq!(v100["sites"][0][0], "1:1");
 }
 
+/// M6 (spec §4 debt ledger): `figmog import-variables`' JSON output shape
+/// is exactly `{"imported": N}`, counting only `Variable` records —
+/// `variables-export.json` has 3 variables across 2 collections, so
+/// `imported` must be 3, not 5.
+#[test]
+fn import_variables_output_shape_is_the_variable_count_alone() {
+    let (dir, db) = fixture_db();
+    let export = dir.path().join("vars.json");
+    std::fs::write(&export, include_str!("fixtures/variables-export.json")).unwrap();
+
+    let out = Command::cargo_bin("figmog")
+        .unwrap()
+        .args(["import-variables", export.to_str().unwrap(), "--db", &db])
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(v, serde_json::json!({"imported": 3}));
+}
+
+/// M6 (spec §4 debt ledger): `figmog tools`' JSON output shape — an array
+/// with one `{name, source, cacheable}` row per tool, nothing more.
+/// `--no-upstream` keeps this offline and deterministic: exactly the 19
+/// local `figmog_*` tools, every one `source: "local"`.
+#[test]
+fn tools_output_shape_is_name_source_cacheable_rows() {
+    let out = Command::cargo_bin("figmog")
+        .unwrap()
+        .args(["tools", "--no-upstream"])
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let rows = v.as_array().expect("tools output is a JSON array");
+    assert_eq!(rows.len(), 19, "19 local figmog_* tools, no upstream");
+    for row in rows {
+        let obj = row.as_object().expect("each row is a JSON object");
+        let keys: std::collections::BTreeSet<&str> = obj.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            ["name", "source", "cacheable"].into_iter().collect(),
+            "row has exactly name/source/cacheable: {row}"
+        );
+        assert_eq!(obj["source"], serde_json::json!("local"));
+        assert!(obj["name"].as_str().unwrap().starts_with("figmog_"));
+    }
+}
+
+/// M5 (spec §4 debt ledger): `figmog tools` never opens the store, so it
+/// must not require a resolved mirror — unlike every other command, it
+/// works with no `.figmog/current` and no `--db` at all.
+#[test]
+fn tools_works_with_no_established_mirror() {
+    let dir = tempfile::tempdir().unwrap();
+    Command::cargo_bin("figmog")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["tools", "--no-upstream"])
+        .assert()
+        .success();
+    assert!(
+        !dir.path().join(".figmog").exists(),
+        "figmog tools must not create or require a mirror"
+    );
+}
+
 #[test]
 fn failed_pull_does_not_persist_current_or_create_store() {
     let dir = tempfile::tempdir().unwrap();

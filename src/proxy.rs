@@ -1,7 +1,7 @@
 //! Cached-proxy routing rules (build design §12): the namespace rule,
 //! registry merge, and the cacheable-call rule. Pure and side-effect-free
 //! (no store, no upstream I/O) so they're unit-testable in isolation —
-//! `serve.rs` and `cli.rs` both drive real store/upstream state through
+//! `serve.rs` and `cli/` both drive real store/upstream state through
 //! these same decisions.
 
 use serde_json::{Value, json};
@@ -140,8 +140,20 @@ pub(crate) fn proxy_call<U: UpstreamMcp, P: Push<Keyed<Id, Rec>>>(
         // identical call gets a fresh attempt instead of a stuck failure.
         let is_error = result.get("isError") == Some(&Value::Bool(true));
         if !is_error && let Some(version) = &version {
-            let args_canonical = canonical_args(args)?;
-            cache::store(st, name, &args_canonical, version, &result)?;
+            // A failure here (`canonical_args`'/`cache::store`'s only real
+            // failure mode: `content` can't be serialized — see
+            // `cache::store`'s doc comment) is a caching problem, not an
+            // upstream one: the tool call itself already succeeded, and a
+            // successful response reaching the client must not be turned
+            // into a call failure just because writing it to `proxy_cache`
+            // didn't work. Log and move on; the next identical call simply
+            // misses the cache and re-fetches, same as today.
+            match canonical_args(args).and_then(|args_canonical| {
+                cache::store(st, name, &args_canonical, version, &result)
+            }) {
+                Ok(()) => {}
+                Err(e) => eprintln!("figmog: failed to cache {name} response: {e}"),
+            }
         }
         return Ok((result, false));
     }
@@ -334,6 +346,40 @@ mod tests {
             )
         });
         assert_eq!(stored, Some(value));
+    }
+
+    /// M3 (spec §4 debt ledger): a cache-write failure must never turn a
+    /// successful upstream call into a failed one — `proxy_call` logs to
+    /// stderr and still hands the client the successful result. `content: &
+    /// serde_json::Value` can't actually construct a non-finite float
+    /// through the crate's public API (`Number::from_f64`/`From<f64>` both
+    /// reject NaN/infinity outright), so `cache::store`'s only documented
+    /// failure mode is unreachable from safe code — this test instead pins
+    /// the happy path this refactor must leave unchanged (value + poll
+    /// flag + the row landing in `proxy_cache`), the same "proven by
+    /// inspection, not by triggering it" stance `open_store_checked`'s own
+    /// doc comment takes for its equally unreachable non-lock-panic branch.
+    #[test]
+    fn proxy_call_cache_write_never_fails_the_call_on_the_happy_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = crate::open_store!(dir.path().join("db"));
+        let mut upstream = FakeUpstream::new(vec![]);
+        upstream.push_result(Ok(json!({"content": [{"type": "text", "text": "fresh"}]})));
+
+        let result = proxy_call(
+            &mut st,
+            &mut upstream,
+            "get_code",
+            &json!({"nodeId": "1:2"}),
+            (Some("100".to_string()), None),
+        );
+        assert!(result.is_ok(), "a successful upstream call must stay Ok");
+        let (value, poll) = result.unwrap();
+        assert_eq!(
+            value,
+            json!({"content": [{"type": "text", "text": "fresh"}]})
+        );
+        assert!(!poll);
     }
 
     #[test]

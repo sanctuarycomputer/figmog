@@ -1,21 +1,77 @@
 # figmog
 
-*(README rewrite lands in a later commit — this pass only strips sections
-that would otherwise describe removed surfaces.)*
+A fold-backed local mirror of one or more Figma files: `pull` fetches a
+file once and keeps materialized indexes in a local database, so every
+read after that — search, tree walks, component/style/variable queries —
+answers from local storage in milliseconds, spending zero Figma API calls
+and hitting zero rate limits. `figmog serve` runs the same engine as an
+MCP stdio server with its own poll loop, plus a cached proxy to Figma's
+native desktop MCP server, so it can be the only Figma MCP an agent needs
+to connect.
 
-A fold-backed local mirror of one Figma file: `pull` fetches it once and
-keeps materialized indexes in a fold database, so every read after that —
-search, tree walks, component/style/variable queries — answers from local
-storage in milliseconds, spending zero Figma API calls and hitting zero
-rate limits.
+See [`docs/SPEC.md`](docs/SPEC.md) for the full current-state spec
+(architecture, data model, sync semantics, the MCP tool surface, the
+cached proxy, variables, and the determinism/schema-stability contracts).
+
+## License
+
+figmog's own code is MIT (see [`LICENSE`](LICENSE)). It depends on
+[`fold`](https://github.com/flowercomputers/bogkit) via a pinned git
+dependency; upstream `bogkit` currently ships with no license file.
+Building and running figmog locally from source is fine, but **broader
+redistribution of binaries that embed `fold` waits on upstream adding a
+license** — the release workflow lands ready, but publishing beyond this
+repo's own testing releases is a deliberate, separate decision.
+
+## Install
+
+### From a release binary
+
+Download the tarball for your platform from
+[Releases](https://github.com/sanctuarycomputer/figmog/releases)
+(`figmog-<version>-<target>.tar.gz` — `aarch64-apple-darwin`,
+`x86_64-apple-darwin`, or `x86_64-unknown-linux-gnu`), then:
+
+```console
+$ tar xzf figmog-<version>-<target>.tar.gz
+$ chmod +x figmog
+$ ./figmog --help
+```
+
+**macOS: unsigned binary.** These builds are not code-signed or notarized
+(no Apple Developer account in the loop yet), so Gatekeeper will refuse
+to run the downloaded binary until you clear the quarantine attribute
+once:
+
+```console
+$ xattr -d com.apple.quarantine ./figmog
+```
+
+### From source
+
+Needs a Rust toolchain and network access (the build fetches `fold` from
+its pinned git rev):
+
+```console
+$ git clone https://github.com/sanctuarycomputer/figmog.git
+$ cd figmog
+$ cargo build --release
+$ ./target/release/figmog --help
+```
+
+Every `figmog ...` example below assumes a `figmog` binary on your
+`PATH` (a release download, or `./target/release/figmog` after a
+from-source build) — substitute `cargo run --release --` in place of
+`figmog` if you'd rather run straight from a source checkout without
+installing the binary anywhere, e.g. `cargo run --release -- pull <url>`.
 
 ## Quick start
 
 ```console
 $ export FIGMA_TOKEN=figd_…            # figma.com → settings → security → personal access tokens
-$ cargo run -p figmog -- pull "https://www.figma.com/design/<key>/<name>"
-$ cargo run -p figmog -- search "pricing card"
-$ cargo run -p figmog -- serve          # MCP server with its own poll loop, in another terminal
+$ figmog pull "https://www.figma.com/design/<key>/<name>"
+$ figmog search "pricing card"
+$ figmog serve                          # MCP server with its own poll loop, in another terminal
 ```
 
 After the first `pull`, figmog remembers the file key (in `.figmog/current`
@@ -32,8 +88,8 @@ printed); errors always print `{"error": ...}` on stderr. `--db <path>`
 | command | reads | behavior |
 |---|---|---|
 | `figmog pull [file] [--from-file <json>] [--fresh]` | — | sync now; prints a churn summary (`+added ~changed -removed`). `file` is optional after the first pull. `--from-file` ingests a saved `GET /v1/files/:key` response instead of the network (offline ingestion, and what keeps the CLI tests hermetic). `--fresh` wipes the store **and the proxy response cache** and rebuilds from scratch. |
-| `figmog serve [file] [--interval N] [--no-watch] [--upstream <url>] [--no-upstream]` | — | MCP stdio server (see "Use from agents (MCP)" below); polls for changes itself (`--interval` seconds, default 10) and pulls only on an actual change; `--no-watch` disables that poll loop for a read-only, offline server; `--no-upstream` disables the cached proxy to Figma's native desktop MCP server |
-| `figmog tools [--upstream <url>] [--no-upstream]` | — | list every tool `figmog serve` would expose for this mirror: name, source (`local`/`upstream`), and whether it's cache-capable |
+| `figmog serve [file...] [--interval N] [--no-watch] [--upstream <url>] [--no-upstream]` | — | MCP stdio server (see "Use from agents (MCP)" below); polls for changes itself (`--interval` seconds, default 10) and pulls only on an actual change; `--no-watch` disables that poll loop for a read-only, offline server; `--no-upstream` disables the cached proxy to Figma's native desktop MCP server |
+| `figmog tools [--upstream <url>] [--no-upstream]` | — | list every tool `figmog serve` would expose for this mirror: name, source (`local`/`upstream`), and whether it's cache-capable. Never opens the store — works with no established mirror at all. |
 | `figmog call <tool> [--args '<json>'] [--upstream <url>] [--no-upstream]` | — | invoke any tool by name through the same dispatch `figmog serve` uses — local `figmog_*` tools and, when attached, any upstream tool |
 | `figmog status` | meta + nodes | file name, version, last modified, node count |
 | `figmog pages` | by_type + nodes | list CANVAS pages (id, name) |
@@ -74,6 +130,13 @@ this polling design is what makes that budget workable for an agent that
 wants to treat the file as live. The Tier-3 meta poll itself is capped
 around **50 requests/min on Starter**, well above any sane `--interval`.
 
+**Freshness is polling, not push.** figmog only learns a file changed the
+next time it polls (or the next explicit `pull`) — there is no webhook or
+subscription, so a change can take up to `--interval` seconds to be
+reflected (Figma's own `FILE_UPDATE` webhook is Enterprise-only and
+debounced up to 30 minutes even where it exists, so polling a cheap
+Tier-3 endpoint is both simpler and faster in practice).
+
 ## Use from agents (MCP)
 
 **figmog is the only Figma MCP an agent needs to connect.** `figmog serve`
@@ -89,15 +152,14 @@ any of it. `figmog serve` also mirrors more than one file in one process —
 see "Multiple files" below.
 
 ```console
-$ cargo build -p figmog
-$ claude mcp add figmog -- /absolute/path/to/clog/target/debug/figmog serve "https://www.figma.com/design/<key>/<name>"
+$ claude mcp add figmog -- /absolute/path/to/figmog serve "https://www.figma.com/design/<key>/<name>"
 ```
 
 Read-only / offline, once a store already exists (no `FIGMA_TOKEN`
 needed):
 
 ```console
-$ claude mcp add figmog -- /absolute/path/to/clog/target/debug/figmog serve --db .figmog/<key>/db --no-watch
+$ claude mcp add figmog -- /absolute/path/to/figmog serve --db .figmog/<key>/db --no-watch
 ```
 
 `--interval N` (default 10s) controls the poll cadence of `serve`'s
@@ -127,7 +189,7 @@ file — the first `FILE` given at startup, or whichever got mirrored first
 if none were.
 
 ```console
-$ claude mcp add figmog -- /absolute/path/to/clog/target/debug/figmog serve
+$ claude mcp add figmog -- /absolute/path/to/figmog serve
 ```
 
 With more than one mirrored file, the poll loop round-robins: each tick
@@ -153,10 +215,10 @@ Two tools manage the mirror set directly:
 - `figmog_files` — list every mirrored file: key, name, version, node
   count, last synced time, and which one (if any) is the default.
 
-**Proxied tools caveat (spec §14, verbatim):** "the desktop server
-operates on the file open in the Figma app; the `file` argument does not
-route proxied tools." A `file` argument sent on a non-`figmog_*` call is
-simply ignored — the desktop server has no concept of "which file", so
+**Proxied tools caveat:** the desktop server operates on the file open in
+the Figma app; the `file` argument does not route proxied tools. A `file`
+argument sent on a non-`figmog_*` call is simply ignored — the desktop
+server has no concept of "which file", so
 `get_code`/`get_design_context`/etc. always answer for whatever file is
 open in the Figma app, independent of any mirror `figmog serve` manages.
 
@@ -170,9 +232,9 @@ a later poll-tick pull — writes it.
 
 CLI commands (`pull`, `status`, and the rest) are unchanged and
 still address exactly one file via `--db`/`.figmog/current` — multi-file
-addressing is a `serve` capability only (spec §14 non-goal: no CLI
-multi-file addressing, no cross-file queries, no idle-session eviction —
-a session opened stays open for the process's life).
+addressing is a `serve` capability only (no CLI multi-file addressing, no
+cross-file queries, no idle-session eviction — a session opened stays
+open for the process's life).
 
 ### The cached proxy
 
@@ -187,7 +249,7 @@ desktop server is reachable to attach it.
 
 - `--upstream <url>` overrides the desktop server's URL.
 - `--no-upstream` disables proxying entirely — figmog serves its 19
-  `figmog_*` tools only, exactly like v2 (plus v4's multi-file surface).
+  `figmog_*` tools only.
 - **Namespace rule:** `figmog_*` tools are always local; every other tool
   name is always proxied. If the desktop server ever advertised a tool
   named `figmog_*`, figmog would drop it and log a warning rather than
@@ -201,7 +263,9 @@ desktop server is reachable to attach it.
   version hasn't changed since. Selection-based calls (no explicit node
   id) are always forwarded live. A version bump (from a pull, whether the
   poll loop's or `figmog_sync`'s) evicts every cache row tagged with the
-  old version.
+  old version. A cache-write failure (practically unreachable in
+  practice) is logged to stderr but never fails the call — the upstream
+  response already succeeded and still reaches the client.
 - **Only two things spend Figma's API/rate budget:** `figmog_sync` (a
   forced pull) and any proxied, native-named tool call that reaches the
   desktop server (a cache hit doesn't). Every `figmog_*` read tool is
@@ -230,11 +294,11 @@ invocation (no persistent connection between CLI calls). There are
 deliberately no bespoke subcommands for upstream tools — Figma's tool
 list churns; `figmog call` is the stable, generic surface.
 
-`figmog tools` and `figmog call` both require a resolved mirror — an
-established `.figmog/current` (from a prior `pull`) or an explicit `--db
-<path>` — even though `figmog tools` itself never reads the store; with
-neither, both exit 1 with `no mirror here — run figmog pull <file-url>
-first`.
+`figmog call` requires a resolved mirror — an established
+`.figmog/current` (from a prior `pull`) or an explicit `--db <path>` —
+since local tool dispatch reads the store; with neither, it exits 1 with
+`no mirror here — run figmog pull <file-url> first`. `figmog tools` never
+reads the store, so it works with no resolved mirror at all.
 
 ### Core read tools
 
@@ -274,6 +338,18 @@ optional `file` argument.
 | `figmog_where` | `figmog where --pointer /p --equals <json>` | `pointer` (required, RFC 6901 into `raw`), `equals`, `page` | matching `[{id, name, type, page_id, value}]`, sorted by id |
 | `figmog_at` | `figmog at --x N --y N` | `x`, `y` (required) | nodes whose `abs_bounds` contain the point, sorted by area ascending (deepest/smallest first) |
 
+### `figmog_open` / `figmog_files`
+
+Manage the multi-file mirror set directly (see "Multiple files" above):
+
+| tool | input | answer |
+|---|---|---|
+| `figmog_open` | `file` (required) | mirror a file now (spends one Tier-1 pull); creates or re-syncs it; returns churn + node count |
+| `figmog_files` | — | every mirrored file: key, name, version, node count, last synced time, and which one is the default |
+
+That's 12 core read tools + 5 structural queries + 2 multi-file
+management tools = **19 `figmog_*` tools** in total.
+
 ### Relationship to Figma's official MCP server
 
 figmog **replaces** the official desktop MCP server in an agent's config —
@@ -294,9 +370,9 @@ mirror and only ever write to it via `figmog_sync`, the one local tool
 that spends Figma's Tier-1 rate budget (a forced pull) — every other
 local tool call is instant, free, and backed by the same
 fold-materialized indexes the CLI reads. Proxied tools go through the
-cache described above. `--no-upstream` recovers the older, "second,
-separate server" shape (v2) if that's ever preferable — figmog's 19
-`figmog_*` tools alongside Figma's own, unrelated MCP connection.
+cache described above. `--no-upstream` recovers the "second, separate
+server" shape if that's ever preferable — figmog's 19 `figmog_*` tools
+alongside Figma's own, unrelated MCP connection.
 
 ## Variables
 
@@ -372,11 +448,11 @@ verify it by hand:
 
 ```console
 $ export FIGMA_TOKEN=figd_…
-$ cargo run -p figmog -- pull <figma url>
-$ cargo run -p figmog -- status
-$ cargo run -p figmog -- components
-$ cargo run -p figmog -- search "pricing card"
-$ cargo run -p figmog -- vars
+$ figmog pull <figma url>
+$ figmog status
+$ figmog components
+$ figmog search "pricing card"
+$ figmog vars
 ```
 
 `pull` pays the one Tier-1 fetch and prints a churn summary. Every command
@@ -386,11 +462,27 @@ the mirrored file is.
 
 ## Limitations
 
-- **Variables** — on non-Enterprise plans (no automatic `variables/local`
-  sync), inference (always on) covers each variable's default-mode value;
-  a non-default mode's value is visible only where a frame explicitly
-  overrides that mode. Full per-mode fidelity requires either the
-  Enterprise auto-sync or a manual `import-variables`.
+- **Variables are plan-gated** — on non-Enterprise plans (no automatic
+  `variables/local` sync), inference (always on) covers each variable's
+  default-mode value; a non-default mode's value is visible only where a
+  frame explicitly overrides that mode. Full per-mode fidelity requires
+  either the Enterprise auto-sync or a manual `import-variables`.
+- **The desktop proxy needs the Figma app open on the right file** — the
+  desktop MCP server has no concept of "which file"; every proxied
+  (non-`figmog_*`) tool call answers for whatever file is currently open
+  in the Figma desktop app, independent of any mirror `figmog serve`
+  manages, and a `file` argument sent on such a call is silently ignored.
+- **Freshness is polling, not push** — `figmog serve`'s poll loop polls
+  the cheap `last_touched_at` metadata field on an interval; a change can
+  take up to `--interval` seconds to be reflected, and Figma's
+  `FILE_UPDATE` webhook (unavailable on the free plan, debounced up to 30
+  minutes even where it exists) isn't used.
+- **Single-writer store** — fjall allows only one open handle per store.
+  `figmog serve` holds an exclusive lock on its `--db` for its whole
+  life; a CLI command against the same store while `serve` is running
+  fails fast with a clean `store is locked` error (exit 1), not a raw
+  panic — drive the running server through its own MCP tool calls
+  instead, or stop `serve` first.
 - **No image renders** — figmog mirrors document structure and properties,
   not rendered pixels; there's no `GET /v1/images` integration.
 - **Style definitions are derived, not authoritative** — the file JSON's
@@ -399,12 +491,6 @@ the mirrored file is.
   consumer node's resolved properties (e.g. a text style's `TypeStyle`
   from a TEXT node that uses it) — if a style currently has no consumers,
   it has no derivable value.
-- **Change detection is polling, not webhooks** — `figmog serve`'s poll
-  loop polls the cheap `last_touched_at` metadata field on an interval;
-  Figma's `FILE_UPDATE` webhook is unavailable on the free plan and
-  debounced up to 30 minutes
-  even where it exists, so polling a cheap Tier-3 endpoint is both
-  simpler and faster.
 - **Instance overrides beyond the serialized subtree are not resolved** —
   Figma serializes an INSTANCE's overridden children as ordinary nodes
   under it, and those mirror like any other node, but overrides that
