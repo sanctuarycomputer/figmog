@@ -381,6 +381,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
         }
     }
 
+    let db_given = cli.db.is_some();
     let db = resolve_db(&cli)?;
     let no_socket = cli.no_socket;
     match cli.cmd {
@@ -396,7 +397,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             format,
             scale,
             out,
-        } => images::cmd_images(&db, no_socket, ids, format, scale, out),
+        } => images::cmd_images(&db, no_socket, db_given, ids, format, scale, out),
         Cmd::Call {
             tool,
             args,

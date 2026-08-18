@@ -9,8 +9,11 @@
 //! lock" for free, because this command writes too). Socket reachable ⇒
 //! route through the very `figmog_images` tool `figmog serve` itself
 //! exposes (spec: "the tool path must exist anyway" — serve owns the
-//! caching); unreachable, or `--no-socket` ⇒ direct network + direct store
-//! open, exactly like `pull`.
+//! caching); unreachable, `--no-socket`, or `--db` ⇒ direct network +
+//! direct store open, exactly like `pull` (spec §10: `--db` names a store
+//! rather than a root, so it bypasses the socket entirely, same as every
+//! other routed command — see `cli::dispatch`'s own `cli.db.is_none()`
+//! gate).
 //!
 //! **Manifest shape**, identical on both paths:
 //! `[{id|ref, kind, format, bytes, cached, path?, error?}]` — `bytes` is
@@ -33,6 +36,7 @@ use super::{Db, open_store_checked, socket, write_json};
 pub(super) fn cmd_images(
     db: &Db,
     no_socket: bool,
+    db_given: bool,
     ids: Vec<String>,
     format: String,
     scale: Option<f64>,
@@ -41,6 +45,7 @@ pub(super) fn cmd_images(
     let out_dir = out.unwrap_or_else(|| PathBuf::from("figmog-images"));
 
     let fetched = if !no_socket
+        && !db_given
         && let Some(result) = socket::try_images_call(
             Path::new(socket::DEFAULT_ROOT),
             json!({"ids": ids, "format": format, "scale": scale, "file": db.key}),

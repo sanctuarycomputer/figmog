@@ -83,6 +83,14 @@ fn query_param(url: &str, key: &str) -> Option<String> {
 /// digits/`:`/`-`/`;` (instance paths), so a byte-level decode is
 /// sufficient — no `+`-as-space handling, since a query *value* here is
 /// never form-encoded space-separated text.
+///
+/// Operates on `s.as_bytes()` throughout and never slices `s` itself by
+/// byte index: `%` followed by a multibyte UTF-8 char (e.g. `%aé`) would
+/// otherwise let `i + 1..i + 3` land mid-char and panic on the
+/// not-a-char-boundary slice. `is_ascii_hexdigit` is checked on the raw
+/// bytes first, so a non-hex (including non-ASCII) byte after `%` always
+/// takes the malformed-escape fallback below instead of ever indexing
+/// into `s`.
 fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -90,12 +98,19 @@ fn percent_decode(s: &str) -> String {
     while i < bytes.len() {
         if bytes[i] == b'%'
             && i + 2 < bytes.len()
-            && let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+            && bytes[i + 1].is_ascii_hexdigit()
+            && bytes[i + 2].is_ascii_hexdigit()
         {
-            out.push(byte);
+            let hi = (bytes[i + 1] as char).to_digit(16).unwrap();
+            let lo = (bytes[i + 2] as char).to_digit(16).unwrap();
+            out.push((hi * 16 + lo) as u8);
             i += 3;
             continue;
         }
+        // Malformed escape (no `%`, truncated, or non-hex bytes follow):
+        // pass the current byte through literally and re-scan from the
+        // next one, same fallback the previous `str`-slicing version used
+        // for a non-hex tail.
         out.push(bytes[i]);
         i += 1;
     }
@@ -197,6 +212,22 @@ mod tests {
             Some((None, "1:2".to_string())),
             "1%3A2 decodes to 1:2, already canonical, normalize_node_id leaves it alone"
         );
+    }
+
+    #[test]
+    fn percent_decode_never_panics_on_a_hex_escape_followed_by_multibyte_utf8() {
+        // F1 regression: `%` + one ASCII byte + a multibyte char used to
+        // slice `&s[i+1..i+3]` mid-char and panic ("byte index 3 is not a
+        // char boundary"). Malformed escapes fall back to passing the `%`
+        // (and whatever follows) through literally, same as a non-hex tail
+        // always has.
+        assert_eq!(percent_decode("%aé"), "%aé");
+        assert_eq!(percent_decode("%é"), "%é");
+        assert_eq!(percent_decode("%"), "%");
+        assert_eq!(percent_decode("%a"), "%a");
+        // Valid escapes are unaffected.
+        assert_eq!(percent_decode("%3A"), ":");
+        assert_eq!(percent_decode("1%3A2"), "1:2");
     }
 
     #[test]
