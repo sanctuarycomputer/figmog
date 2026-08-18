@@ -184,12 +184,27 @@ fn from_socket_result(result: Value) -> Result<Vec<Fetched>, String> {
             let subject = entry.get("id").or_else(|| entry.get("ref"));
             let data = subject.and_then(|subject| {
                 content.iter().skip(1).find_map(|block| {
-                    let matches = block.get("id").or_else(|| block.get("ref")) == Some(subject);
-                    let is_image = block.get("type").and_then(Value::as_str) == Some("image");
-                    (matches && is_image)
-                        .then(|| block.get("data").and_then(Value::as_str))
-                        .flatten()
-                        .and_then(|b64| images::base64_decode(b64).ok())
+                    if block.get("id").or_else(|| block.get("ref")) != Some(subject) {
+                        return None;
+                    }
+                    // `images::to_mcp_content`'s own contract: a payload
+                    // block (image OR svg-as-text) always carries
+                    // `mimeType`; an "oversized, use --out" note never
+                    // does — that field's presence, not the block's
+                    // `type` alone, is what tells the two `text` shapes
+                    // apart (see that function's doc comment).
+                    block.get("mimeType")?;
+                    match block.get("type").and_then(Value::as_str) {
+                        Some("image") => block
+                            .get("data")
+                            .and_then(Value::as_str)
+                            .and_then(|b64| images::base64_decode(b64).ok()),
+                        Some("text") => block
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .map(|s| s.as_bytes().to_vec()),
+                        _ => None,
+                    }
                 })
             });
             Fetched { entry, data }
@@ -251,6 +266,46 @@ mod tests {
         assert_eq!(fetched.len(), 2);
         assert_eq!(fetched[0].data, Some(vec![1, 2, 3]));
         assert_eq!(fetched[1].data, None);
+    }
+
+    /// SVG ruling: an SVG render's payload arrives as a `text` block
+    /// (never `image`), distinguished from a plain oversized note by the
+    /// `mimeType` field's presence — `from_socket_result` must decode it
+    /// back to bytes via the `text` field, not treat it as "no data" just
+    /// because its `type` isn't `image`.
+    #[test]
+    fn from_socket_result_decodes_svg_text_payload_by_mimetype_marker() {
+        let svg = "<svg><rect/></svg>";
+        let result = json!({
+            "isError": false,
+            "content": [
+                {"type": "text", "text": serde_json::to_string(&json!([
+                    {"id": "1:2", "kind": "render", "format": "svg", "bytes": svg.len(), "cached": false},
+                ])).unwrap()},
+                {"type": "text", "id": "1:2", "text": svg, "mimeType": "image/svg+xml"},
+            ],
+        });
+        let fetched = from_socket_result(result).unwrap();
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].data, Some(svg.as_bytes().to_vec()));
+    }
+
+    /// An oversized-note `text` block (no `mimeType`) must never be
+    /// mistaken for an SVG payload just because both are `type: "text"`.
+    #[test]
+    fn from_socket_result_does_not_mistake_an_oversized_note_for_svg_payload() {
+        let result = json!({
+            "isError": false,
+            "content": [
+                {"type": "text", "text": serde_json::to_string(&json!([
+                    {"id": "1:2", "kind": "render", "format": "svg", "bytes": 2_000_000, "cached": false},
+                ])).unwrap()},
+                {"type": "text", "id": "1:2", "text": "too large, use --out"},
+            ],
+        });
+        let fetched = from_socket_result(result).unwrap();
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].data, None);
     }
 
     #[test]

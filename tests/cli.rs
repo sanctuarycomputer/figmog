@@ -1383,3 +1383,22 @@ fn images_with_no_established_mirror_fails_like_every_other_command() {
     let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
     assert!(stderr.contains("no mirror here"), "stderr: {stderr}");
 }
+
+/// `figmog images` with zero ids is a clap usage error, not a runtime one
+/// (matching the `figmog_images` tool's own explicit `` `ids` must not be
+/// empty `` rejection in `dispatch::require_str_array`) — never gets far
+/// enough to open a store or hit the network.
+#[test]
+fn images_with_no_ids_is_rejected_by_clap() {
+    let out = Command::cargo_bin("figmog")
+        .unwrap()
+        .args(["images"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    assert!(
+        stderr.to_lowercase().contains("required")
+            || stderr.to_lowercase().contains("the following required"),
+        "expected clap to reject a missing required `ids` argument: {stderr}"
+    );
+}

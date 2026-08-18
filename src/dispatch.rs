@@ -515,7 +515,7 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "figmog_images",
-            description: "Download node renders and/or fill images (v0.0.2 spec §5), cached by file version — spends Figma API budget (the images endpoints are the most rate-limited; never called automatically). Returns image content blocks (base64) for items up to 1MB, plus a JSON manifest; larger items point at the CLI's `figmog images --out` instead.",
+            description: "Download node renders and/or fill images (v0.0.2 spec §5), cached by file version — spends Figma API budget (the images endpoints are the most rate-limited; never called automatically). Returns a JSON manifest plus, per item up to 1MB encoded: an image content block (base64) for raster formats, or the raw SVG markup as a text block for format=svg; larger items point at the CLI's `figmog images --out` instead.",
             input_schema: json!({
                 "type": "object",
                 "properties": {

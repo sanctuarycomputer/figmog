@@ -221,7 +221,8 @@ enum Cmd {
     /// Figma's most rate-limited.
     Images {
         /// Node ids (or Figma URLs carrying node-id=) to render, and/or
-        /// scan for fill imageRefs.
+        /// scan for fill imageRefs. At least one required.
+        #[arg(required = true)]
         ids: Vec<String>,
         #[arg(long, default_value = "png")]
         format: String,

@@ -56,9 +56,18 @@ pub const FILL: &str = "fill";
 const NO_TOKEN_MSG: &str = "FIGMA_TOKEN not set — required for image downloads";
 
 /// Content blocks over roughly this many bytes are excluded from the MCP
-/// tool's inline `image` content (spec §5's "1MB" cap) — 1 MiB exactly,
-/// matching the spec's own "1MB each" wording as closely as a byte count
-/// can.
+/// tool's inline content (spec §5's "1MB" cap) — 1 MiB exactly, matching
+/// the spec's own "1MB each" wording as closely as a byte count can.
+///
+/// **Measured on the encoded payload actually shipped, not raw image
+/// bytes.** A raster image ships as base64, which inflates the raw byte
+/// count by roughly 4/3 (RFC 4648) — a ~786KB PNG becomes a ~1.05MB
+/// `data` string, already over this cap even though the *file* is well
+/// under 1MB. `to_mcp_content` therefore encodes once, measures the
+/// encoded string's length, and compares that (see its own doc comment).
+/// SVG ships as raw text (no base64 step — see that function's SVG
+/// branch), so for SVG this cap is measured on the markup's own UTF-8
+/// byte length directly, which happens to equal the raw byte count.
 pub const CONTENT_SIZE_CAP: usize = 1_048_576;
 
 /// Deterministic hex key for one cached image row: FNV-1a 64 (same
@@ -168,6 +177,30 @@ pub struct Scanned {
     fill_hits: BTreeMap<String, ImageItem>,
 }
 
+/// Whether a row fetched by its key hash actually belongs to the
+/// requested `(kind, subject)` pair (and, for a render, the requested
+/// `format`/`scale_milli` too) — the same "never trust the key hash
+/// alone" discipline `cache::lookup` documents (I-3 there): a
+/// non-cryptographic FNV-64 hash is trivially collidable, and a colliding
+/// row must read as a miss, not get served as a different item's bytes.
+/// Fills skip the format/scale check on purpose: [`image_key`] always
+/// keys a fill's row with `format = ""`/`scale_milli = 1000` regardless
+/// of the format actually discovered on download (see that function's
+/// own doc comment), so checking the *stored* `format` there would reject
+/// every legitimate fill hit, not just collisions.
+fn matches_identity(
+    rec: &ImageBlobRec,
+    kind: &str,
+    subject: &str,
+    format: &str,
+    scale_milli: u32,
+) -> bool {
+    if rec.kind != kind || rec.subject != subject {
+        return false;
+    }
+    kind != RENDER || (rec.format == format && rec.scale_milli == scale_milli)
+}
+
 /// Read-only half of image fetching: cache lookups plus fill-ref
 /// detection, against already-open table readers — call inside
 /// `st.rtx(|tuple| images::scan(..))` at a concrete `open_store!` site.
@@ -187,6 +220,7 @@ pub fn scan<R: Readable>(
         let key = image_key(RENDER, id, format, scale_milli);
         if let Some(rec) = images.get(&key)
             && rec.file_version == version
+            && matches_identity(&rec, RENDER, id, format, scale_milli)
         {
             render_hits.insert(
                 id.clone(),
@@ -216,6 +250,7 @@ pub fn scan<R: Readable>(
         let key = image_key(FILL, r, "", 1000);
         if let Some(rec) = images.get(&key)
             && rec.file_version == version
+            && matches_identity(&rec, FILL, r, "", 1000)
         {
             fill_hits.insert(
                 r.clone(),
@@ -491,14 +526,30 @@ fn mime_for(format: &str) -> &'static str {
 }
 
 /// Build the MCP `tools/call` result for `figmog_images` (spec §5):
-/// content is always `[manifest text block, image blocks...]` — the
+/// content is always `[manifest text block, per-item blocks...]` — the
 /// manifest first and always text, so a socket-routed CLI client (see
 /// `cli::images`) can find it at `content[0]` unambiguously regardless of
-/// how many (if any) image blocks follow. One `image` block per item that
-/// downloaded successfully and is at or under [`CONTENT_SIZE_CAP`], in the
-/// same order as `items`; an oversized success gets an extra text note
-/// instead (an error item gets neither — its manifest entry already
-/// carries the reason).
+/// how many (if any) data-bearing blocks follow. Per successful item, in
+/// the same order as `items`:
+///
+/// - **SVG** (`item.format` case-insensitively `"svg"`) ships as a
+///   **`text`** block carrying the raw markup verbatim — never base64 nor
+///   `image/svg+xml` (spec ruling): raw SVG text is more directly useful
+///   to an agent generating HTML/CSS than an opaque image blob, and MCP
+///   clients render `image/svg+xml` image blocks inconsistently. The
+///   block also carries a `mimeType: "image/svg+xml"` field (informational
+///   only — MCP's `text` content type doesn't define one) so a consumer
+///   can tell an actual-SVG-content block apart from an oversized note
+///   below without guessing from prose.
+/// - **Every other format** ships as an `image` block, base64-encoded.
+///
+/// Either way, over [`CONTENT_SIZE_CAP`] (measured on the *encoded*
+/// payload — the block's own `text`/`data` string — not the raw byte
+/// count; see that constant's doc comment) gets a plain text note instead
+/// (no `mimeType`, the marker above's absence is what makes it
+/// distinguishable from a real SVG block), pointing at `figmog images
+/// --out`. An error item gets neither — its manifest entry already
+/// carries the reason.
 pub fn to_mcp_content(items: &[ImageItem]) -> Value {
     let manifest: Vec<Value> = items.iter().map(ImageItem::manifest_entry).collect();
     let mut content = vec![json!({
@@ -510,39 +561,65 @@ pub fn to_mcp_content(items: &[ImageItem]) -> Value {
             continue;
         }
         let subject_key = if item.kind == RENDER { "id" } else { "ref" };
-        // Non-standard extra field on both arms below, ignored by MCP
-        // clients that don't know it — lets a socket-routed CLI caller
-        // (`cli::images`, the only consumer that reads it) match a block
-        // back to its manifest row without relying on content order alone
-        // (an oversized item contributes a `text` block instead of an
-        // `image` one at the same position, so a plain index zip would
-        // misalign).
-        let mut block = if item.bytes.len() <= CONTENT_SIZE_CAP {
-            serde_json::Map::from_iter([
-                ("type".to_string(), json!("image")),
-                ("data".to_string(), json!(base64_encode(&item.bytes))),
-                ("mimeType".to_string(), json!(mime_for(&item.format))),
-            ])
+        let is_svg = item.format.eq_ignore_ascii_case("svg");
+
+        // Non-standard extra field(s) on every arm below, ignored by MCP
+        // clients that don't know them — let a socket-routed CLI caller
+        // (`cli::images`, the only consumer that reads them) match a
+        // block back to its manifest row, and tell payload from note
+        // apart, without relying on content order alone (an oversized
+        // item's block sits at the same position a payload block would).
+        let mut block = if is_svg {
+            let text = String::from_utf8_lossy(&item.bytes).into_owned();
+            if text.len() <= CONTENT_SIZE_CAP {
+                serde_json::Map::from_iter([
+                    ("type".to_string(), json!("text")),
+                    ("text".to_string(), json!(text)),
+                    ("mimeType".to_string(), json!(mime_for(&item.format))),
+                ])
+            } else {
+                oversized_note(item, subject_key, text.len())
+            }
         } else {
-            serde_json::Map::from_iter([
-                ("type".to_string(), json!("text")),
-                (
-                    "text".to_string(),
-                    json!(format!(
-                        "{} {}={} is {} bytes, over the 1MB inline cap — run `figmog images {} --out <dir>` to download it to disk.",
-                        item.kind,
-                        subject_key,
-                        item.subject,
-                        item.bytes.len(),
-                        item.subject
-                    )),
-                ),
-            ])
+            let encoded = base64_encode(&item.bytes);
+            if encoded.len() <= CONTENT_SIZE_CAP {
+                serde_json::Map::from_iter([
+                    ("type".to_string(), json!("image")),
+                    ("data".to_string(), json!(encoded)),
+                    ("mimeType".to_string(), json!(mime_for(&item.format))),
+                ])
+            } else {
+                oversized_note(item, subject_key, encoded.len())
+            }
         };
         block.insert(subject_key.to_string(), json!(item.subject));
         content.push(Value::Object(block));
     }
     json!({"content": content, "isError": false})
+}
+
+/// The "too large to inline" text block for one item — deliberately never
+/// carries a `mimeType` field, the signal [`to_mcp_content`]'s consumers
+/// use to tell "this text block IS the payload" (an SVG success) from
+/// "this text block is a note" (this function's output).
+/// `encoded_len` is whatever [`to_mcp_content`] actually measured against
+/// [`CONTENT_SIZE_CAP`] (an encoded byte count, not necessarily
+/// `item.bytes.len()` — see that function's own doc comment).
+fn oversized_note(
+    item: &ImageItem,
+    subject_key: &str,
+    encoded_len: usize,
+) -> serde_json::Map<String, Value> {
+    serde_json::Map::from_iter([
+        ("type".to_string(), json!("text")),
+        (
+            "text".to_string(),
+            json!(format!(
+                "{} {}={} is {encoded_len} bytes encoded, over the 1MB inline cap — run `figmog images {} --out <dir>` to download it to disk.",
+                item.kind, subject_key, item.subject, item.subject
+            )),
+        ),
+    ])
 }
 
 // ---- base64 (no crate dependency — see `api::download_bytes`'s doc
@@ -792,6 +869,90 @@ mod tests {
         assert_eq!(out["isError"], json!(false));
     }
 
+    /// I2: the cap must bound the *encoded* payload, not the raw byte
+    /// count — 800,000 raw bytes is comfortably under
+    /// `CONTENT_SIZE_CAP` (1,048,576), but base64's ~4/3 inflation (RFC
+    /// 4648) pushes the actual `data` string this item would ship as over
+    /// it, so it must still fall back to the oversized note.
+    #[test]
+    fn to_mcp_content_caps_on_encoded_length_not_raw_bytes() {
+        let raw_len = 800_000;
+        assert!(raw_len <= CONTENT_SIZE_CAP, "sanity: raw is under the cap");
+        let encoded_len = base64_encode(&vec![0u8; raw_len]).len();
+        assert!(
+            encoded_len > CONTENT_SIZE_CAP,
+            "sanity: encoded crosses the cap"
+        );
+
+        let item = ImageItem {
+            subject: "1:2".into(),
+            kind: RENDER,
+            format: "png".into(),
+            bytes: vec![0u8; raw_len],
+            cached: false,
+            error: None,
+        };
+        let out = to_mcp_content(&[item]);
+        let content = out["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(
+            content[1]["type"],
+            json!("text"),
+            "must fall back to the oversized note, not an image block, once the encoded size crosses the cap"
+        );
+        assert!(
+            content[1]["mimeType"].is_null(),
+            "an oversized note must never carry mimeType — that field is the payload marker"
+        );
+    }
+
+    /// SVG ruling: an SVG render ships as raw markup in a `text` block
+    /// (never base64/`image/svg+xml`), tagged with `mimeType:
+    /// "image/svg+xml"` so a consumer can tell it apart from an oversized
+    /// note (also `text`, but with no `mimeType`).
+    #[test]
+    fn to_mcp_content_ships_svg_as_raw_text_markup_not_base64_image() {
+        let svg = "<svg><rect/></svg>";
+        let item = ImageItem {
+            subject: "1:2".into(),
+            kind: RENDER,
+            format: "svg".into(),
+            bytes: svg.as_bytes().to_vec(),
+            cached: false,
+            error: None,
+        };
+        let out = to_mcp_content(&[item]);
+        let content = out["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[1]["type"], json!("text"));
+        assert_eq!(content[1]["text"], json!(svg));
+        assert_eq!(content[1]["mimeType"], json!("image/svg+xml"));
+        assert_eq!(content[1]["id"], json!("1:2"));
+    }
+
+    /// SVG ruling, size-cap half: the cap still applies to SVG text, same
+    /// encoded-length comparison — for SVG there's no base64 step, so
+    /// "encoded length" is just the markup's own UTF-8 byte length.
+    #[test]
+    fn to_mcp_content_oversized_svg_falls_back_to_a_note_without_mimetype() {
+        let item = ImageItem {
+            subject: "1:2".into(),
+            kind: RENDER,
+            format: "svg".into(),
+            bytes: vec![b'a'; CONTENT_SIZE_CAP + 1],
+            cached: false,
+            error: None,
+        };
+        let out = to_mcp_content(&[item]);
+        let content = out["content"].as_array().unwrap();
+        assert_eq!(content[1]["type"], json!("text"));
+        assert!(
+            content[1]["mimeType"].is_null(),
+            "an oversized SVG note must not carry mimeType either"
+        );
+        assert!(content[1]["text"].as_str().unwrap().contains("--out"));
+    }
+
     // ---- scan + resolve: scripted FigmaApi fake ----
 
     /// Pops one scripted response per call (same pattern as
@@ -896,6 +1057,83 @@ mod tests {
                 }),
             );
         });
+    }
+
+    // ---- I-3-style collision safety (mirrors cache.rs's own test) ----
+
+    /// A row that collides on `image_key`'s hash but actually belongs to a
+    /// different `(kind, subject)` pair must read as a miss, not get
+    /// served as a different item's bytes — exactly the guarantee
+    /// `cache::lookup`'s own collision test proves for `proxy_cache`.
+    #[test]
+    fn scan_misses_on_collision_where_key_matches_but_kind_and_subject_dont() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = crate::open_store!(dir.path().join("db"));
+        insert_meta(&mut st, "100");
+
+        let requested_id = "1:2".to_string();
+        let key = image_key(RENDER, &requested_id, "png", 1000);
+        // Constructed directly under the exact key a render lookup for
+        // `requested_id` will compute, but tagged as a *fill* for a
+        // different subject — exactly what a real FNV-64 collision would
+        // look like, without needing to actually find one.
+        let colliding = ImageBlobRec {
+            key_hash: key.clone(),
+            kind: FILL.to_string(),
+            subject: "some-other-ref".to_string(),
+            format: "jpg".to_string(),
+            scale_milli: 1000,
+            file_version: "100".to_string(),
+            bytes: vec![9, 9, 9],
+        };
+        st.wtx(|tx| {
+            tx.upsert(&Id::ImageBlob(key), &Rec::ImageBlob(colliding));
+        });
+
+        let ids = vec![requested_id.clone()];
+        let scanned = st.rtx(|((nodes, ..), _, _, _, _, _, meta, _, _, images)| {
+            scan(&nodes, &meta, &images, &ids, "png", 1000)
+        });
+        assert!(
+            !scanned.render_hits.contains_key(&requested_id),
+            "a key-hash collision must never be served as a cache hit"
+        );
+    }
+
+    /// Same collision guarantee, the render-specific half: a row under the
+    /// right key with the *right* kind/subject but a different requested
+    /// format or scale must still read as a miss — `image_key` folds
+    /// format/scale into the hash, but a real collision could still land
+    /// two distinct `(format, scale)` requests on the same bucket.
+    #[test]
+    fn scan_render_hit_requires_matching_format_and_scale() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = crate::open_store!(dir.path().join("db"));
+        insert_meta(&mut st, "100");
+
+        let requested_id = "1:2".to_string();
+        let key = image_key(RENDER, &requested_id, "png", 1000);
+        let colliding = ImageBlobRec {
+            key_hash: key.clone(),
+            kind: RENDER.to_string(),
+            subject: requested_id.clone(),
+            format: "svg".to_string(), // requested "png"
+            scale_milli: 2000,         // requested 1000
+            file_version: "100".to_string(),
+            bytes: vec![9, 9, 9],
+        };
+        st.wtx(|tx| {
+            tx.upsert(&Id::ImageBlob(key), &Rec::ImageBlob(colliding));
+        });
+
+        let ids = vec![requested_id.clone()];
+        let scanned = st.rtx(|((nodes, ..), _, _, _, _, _, meta, _, _, images)| {
+            scan(&nodes, &meta, &images, &ids, "png", 1000)
+        });
+        assert!(
+            !scanned.render_hits.contains_key(&requested_id),
+            "a format/scale mismatch under the same key must never be served"
+        );
     }
 
     /// `scan` then `resolve`, exactly the two-step call every production

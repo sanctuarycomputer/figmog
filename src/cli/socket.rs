@@ -88,11 +88,13 @@ pub(super) fn tools_rows(tools: &[Value]) -> Value {
 /// §5): returns the raw MCP `result` object (`{"content": [...],
 /// "isError": ...}`) rather than [`interpret_call_response`]'s unwrapped
 /// domain `Value`. `figmog_images`'s content mixes a text manifest block
-/// with `image` (base64) blocks — `interpret_call_response`'s "parse
-/// `content[0]`'s text as figmog's own JSON" contract only fits the
-/// single-text-block shape every other local tool returns, so
-/// `cli::images` (the only caller) needs the whole array to decode the
-/// image blocks and write files itself.
+/// with per-item payload blocks — `image` (base64, raster formats) or
+/// `text` (raw markup, SVG — see `images::to_mcp_content`'s own doc
+/// comment) — `interpret_call_response`'s "parse `content[0]`'s text as
+/// figmog's own JSON" contract only fits the single-text-block shape
+/// every other local tool returns, so `cli::images` (the only caller)
+/// needs the whole array to decode the payload blocks and write files
+/// itself.
 pub(super) fn try_images_call(root: &Path, args: Value) -> Option<Result<Value, String>> {
     let stream = UnixStream::connect(socket_path(root)).ok()?;
     let resp = send_and_recv(
