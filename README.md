@@ -260,6 +260,14 @@ binaries that embed `fold` more widely than this repo's own testing releases
 waits on upstream adding a license, which is a separate decision from
 figmog's own license.
 
+## Figma's terms
+
+figmog works the way Figma's [own API guidance](https://developers.figma.com/docs/rest-api/rate-limits)
+asks integrations to work: cache file data instead of refetching it, and back
+off when the API says to. Every request it makes uses your token, against
+official endpoints, at your seat's normal limits; the mirror exists so there
+are far fewer of those requests.
+
 ## A note for Figma
 
 You already ship a local MCP server for design agents. Shouldn't it work like
