@@ -307,6 +307,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             && let Some(result) = socket::try_tools_list(Path::new(socket::DEFAULT_ROOT))
         {
             let tools = result?;
+            note_ignored_upstream_flags(upstream, *no_upstream);
             return write_json(&socket::tools_rows(&tools));
         }
         return call::cmd_tools(upstream.clone(), *no_upstream);
@@ -323,20 +324,37 @@ fn dispatch(cli: Cli) -> Result<(), String> {
     // `cli.db` was given, exactly like `--no-socket`.
     if !cli.no_socket && cli.db.is_none() {
         let root = Path::new(socket::DEFAULT_ROOT);
-        if let Cmd::Call { tool, args, .. } = &cli.cmd {
+        if let Cmd::Call {
+            tool,
+            args,
+            upstream,
+            no_upstream,
+        } = &cli.cmd
+        {
             let parsed_args: Value = match args {
                 Some(raw) => {
                     serde_json::from_str(raw).map_err(|e| format!("--args: invalid JSON: {e}"))?
                 }
                 None => json!({}),
             };
+            // C1: route to the current mirror, exactly like direct mode's
+            // own `resolve_db` would — except `figmog_open`, whose `file`
+            // argument means "the file to open", not a routing hint (see
+            // `with_current_file`'s doc comment).
+            let parsed_args = if tool == "figmog_open" {
+                parsed_args
+            } else {
+                with_current_file(parsed_args)
+            };
             if let Some(result) = socket::try_call(root, tool, parsed_args) {
+                note_ignored_upstream_flags(upstream, *no_upstream);
                 return write_json(&result?);
             }
-        } else if let Some((tool, tool_args)) = cmd_as_tool_call(&cli.cmd)
-            && let Some(result) = socket::try_call(root, tool, tool_args)
-        {
-            return write_json(&result?);
+        } else if let Some((tool, tool_args)) = cmd_as_tool_call(&cli.cmd) {
+            let tool_args = with_current_file(strip_nulls(tool_args));
+            if let Some(result) = socket::try_call(root, tool, tool_args) {
+                return write_json(&strip_routed_upstream_field(result?));
+            }
         }
     }
 
@@ -517,6 +535,102 @@ fn dispatch(cli: Cli) -> Result<(), String> {
     }
 }
 
+/// Review m5: when a `tools`/`call` invocation explicitly named an
+/// `--upstream`/`--no-upstream` but got routed to the running serve's own
+/// socket, that flag was silently ignored (serve's own upstream connection,
+/// established at its own startup, is what actually answers — see
+/// `socket::try_tools_list`'s doc comment). Rather than leave that silent,
+/// print one stderr note. Detecting "explicitly passed" without clap's
+/// `ArgMatches` introspection is approximate: `no_upstream` is unambiguous
+/// (there's no way to "explicitly pass false" for a plain flag), but
+/// `upstream` can only be compared against its own default value — a user
+/// who explicitly retyped that exact default URL goes unnoted. An
+/// acceptable, documented gap for an informational note, not a behavior
+/// difference.
+fn note_ignored_upstream_flags(upstream: &str, no_upstream: bool) {
+    if no_upstream || upstream != crate::serve::DEFAULT_UPSTREAM_URL {
+        eprintln!(
+            "figmog: --upstream/--no-upstream ignored — routed to the running serve, whose own upstream settings apply"
+        );
+    }
+}
+
+/// Inject `.figmog/current`'s key as the routed `file` argument, when one
+/// is established and the call doesn't already carry an explicit `file`
+/// (review C1): without this, a socket-routed call carries no `file` at
+/// all, so serve answers from *its own* default session
+/// (`SessionManager::effective_default_key`) — which can silently diverge
+/// from the mirror `.figmog/current` (and thus direct mode) actually
+/// targets, or, in the zero-startup-file quick-start shape, doesn't exist
+/// at all (serve has no sessions yet), producing a hard "no default
+/// mirrored file" error even though a mirror is clearly established on
+/// disk. Injecting the current key routes the call through
+/// `SessionManager::resolve`'s explicit-`file` path instead, which
+/// auto-opens that session if serve hasn't touched it yet — a real
+/// Tier-1 pull only if the on-disk store isn't already mirrored (an
+/// already-pulled store never spends one; see `sessions::open_session_at`'s
+/// `mirrored: meta_present`). `.figmog/current` unset ⇒ args unchanged,
+/// preserving today's serve-own-default behavior exactly.
+///
+/// Never applied to `figmog_open`: unlike every other tool, `figmog_open`'s
+/// own `file` argument names the file *to open*, not a routing hint — it's
+/// required, and direct mode's own dispatch correctly rejects an omitted
+/// one; silently defaulting it here would let `figmog call figmog_open`
+/// (no `--args`) succeed over the socket while the exact same invocation
+/// fails direct, breaking the very byte-compatibility this routing exists
+/// to preserve (see `dispatch::cmd_as_tool_call`'s caller).
+fn with_current_file(mut args: Value) -> Value {
+    if let Some(obj) = args.as_object_mut() {
+        let has_file = obj.get("file").is_some_and(|v| !v.is_null());
+        if !has_file && let Some(key) = read_current_key() {
+            obj.insert("file".to_string(), json!(key));
+        }
+    }
+    args
+}
+
+/// Drop every key whose value is JSON `null` from a routed read command's
+/// argument object (review C2): `json!` always emits a null-valued key for
+/// an absent `Option<T>` field rather than omitting it (e.g.
+/// `cmd_as_tool_call`'s `Cmd::Where` arm always has an `equals` key, `null`
+/// when `--equals` was omitted), but `dispatch_read_tool`'s arg helpers use
+/// *presence*, not truthiness — `figmog_where`'s `equals:
+/// args.get("equals").cloned()` treats a present-but-null `equals` as
+/// "match literal null" rather than "no filter", silently returning zero
+/// rows for the common no-`--equals` case over the socket while direct
+/// mode returns every row with that pointer present. Applied once,
+/// generically, to every `cmd_as_tool_call` translation — rather than
+/// hand-rolling conditional insertion in each match arm — so this class of
+/// bug can't recur as new routed commands are added. (One accepted
+/// imprecision: `--equals null` explicitly, an obscure invocation, is now
+/// indistinguishable from omitting `--equals` entirely, since both encode
+/// as a null-valued key before this strip runs either way — direct mode
+/// keeps the finer distinction via `Option<Value>` at the Rust level.)
+fn strip_nulls(mut args: Value) -> Value {
+    if let Some(obj) = args.as_object_mut() {
+        obj.retain(|_, v| !v.is_null());
+    }
+    args
+}
+
+/// Strip the server-spliced `upstream` field from a routed *read command's*
+/// result (review m1): `upstream` is only ever added inside
+/// `dispatch_read_tool`/`handle_tool_call` — the `figmog_status` *tool*'s
+/// own behavior, which the plain `figmog status` read command has never
+/// gone through (`read::cmd_status` calls `query::status` directly, with
+/// no splice at all) — so leaving it in a socket-routed `status` would
+/// make the two modes diverge on this one field even after every other fix
+/// here. A no-op for every other command's result, none of which carry
+/// this key. (`figmog call figmog_status` is unaffected: both modes go
+/// through `dispatch_read_tool` there, so both already carry `upstream`
+/// consistently — this strip is not applied to `Cmd::Call`.)
+fn strip_routed_upstream_field(mut result: Value) -> Value {
+    if let Some(obj) = result.as_object_mut() {
+        obj.remove("upstream");
+    }
+    result
+}
+
 /// Maps a read-only [`Cmd`] to the equivalent local `figmog_*` tool name +
 /// arguments `figmog serve` would answer over the socket (spec §1's CLI
 /// routing) — the exact argument shapes [`crate::dispatch::dispatch_read_tool`]
@@ -634,17 +748,26 @@ fn resolve_db(cli: &Cli) -> Result<Db, String> {
         });
     }
 
-    let key = std::fs::read_to_string(CURRENT_FILE)
-        .map_err(|_| no_mirror_msg(cli))?
-        .trim()
-        .to_string();
-    if key.is_empty() {
-        return Err(no_mirror_msg(cli));
-    }
+    let key = read_current_key().ok_or_else(|| no_mirror_msg(cli))?;
     Ok(Db {
         path: db_path_for(&key),
         key: Some(key),
     })
+}
+
+/// Best-effort read of `.figmog/current` — `None` on any I/O error or an
+/// empty file (the same "no established mirror" cases [`resolve_db`]
+/// turns into an error; socket routing instead treats `None` as "let
+/// serve's own default apply, unchanged" — see [`with_current_file`]).
+/// Shared so both call sites derive the current mirror identically.
+fn read_current_key() -> Option<String> {
+    let key = std::fs::read_to_string(CURRENT_FILE).ok()?;
+    let key = key.trim();
+    if key.is_empty() {
+        None
+    } else {
+        Some(key.to_string())
+    }
 }
 
 /// `pull --from-file` with neither a file ref nor an established key has
@@ -802,5 +925,52 @@ mod tests {
 
         let other_payload: Box<dyn std::any::Any + Send> = Box::new(42i32);
         assert_eq!(panic_message(&*other_payload), "unknown panic");
+    }
+
+    // ---- socket-routing helpers (review C1/C2/m1 fix round) ----
+
+    #[test]
+    fn strip_nulls_drops_null_keys_and_keeps_everything_else() {
+        let args = strip_nulls(json!({
+            "pointer": "/layoutMode",
+            "equals": null,
+            "page": null,
+            "under": "1:1",
+            "limit": 0,
+        }));
+        assert_eq!(
+            args,
+            json!({"pointer": "/layoutMode", "under": "1:1", "limit": 0})
+        );
+    }
+
+    #[test]
+    fn strip_nulls_is_a_no_op_on_an_object_with_no_nulls() {
+        let args = json!({"id": "1:1", "children": true});
+        assert_eq!(strip_nulls(args.clone()), args);
+    }
+
+    #[test]
+    fn strip_routed_upstream_field_removes_only_that_key() {
+        let result = strip_routed_upstream_field(json!({
+            "name": "Fixture",
+            "nodes": 12,
+            "upstream": "connected",
+        }));
+        assert_eq!(result, json!({"name": "Fixture", "nodes": 12}));
+    }
+
+    #[test]
+    fn strip_routed_upstream_field_is_a_no_op_when_absent() {
+        let result = json!({"name": "Fixture", "nodes": 12});
+        assert_eq!(strip_routed_upstream_field(result.clone()), result);
+    }
+
+    #[test]
+    fn with_current_file_never_overrides_an_explicit_non_null_file() {
+        // No filesystem dependency either way: an explicit `file` short-
+        // circuits before `read_current_key` is ever consulted.
+        let args = with_current_file(json!({"id": "1:1", "file": "explicitkey12345678"}));
+        assert_eq!(args["file"], json!("explicitkey12345678"));
     }
 }

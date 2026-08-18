@@ -133,9 +133,24 @@ fn send_and_recv(stream: UnixStream, frame: &Value) -> Result<Value, String> {
 
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
-    let n = reader
-        .read_line(&mut line)
-        .map_err(|e| format!("reading from serve socket: {e}"))?;
+    let n = reader.read_line(&mut line).map_err(|e| {
+        // Review m2: a timed-out read (the timeout set above) reads as a
+        // generic OS error otherwise (`"Resource temporarily unavailable"`
+        // or similar, depending on platform) — spell out what actually
+        // happened and the escape hatch, rather than leaving the operator
+        // to guess.
+        if matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ) {
+            format!(
+                "figmog serve did not respond within {}s (is it wedged? try --no-socket)",
+                SOCKET_TIMEOUT.as_secs()
+            )
+        } else {
+            format!("reading from serve socket: {e}")
+        }
+    })?;
     if n == 0 {
         return Err("serve socket closed before responding".to_string());
     }
