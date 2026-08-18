@@ -33,7 +33,7 @@
 //!
 //! **v3 (build design §12):** unless `--no-upstream`, figmog also probes
 //! Figma's native desktop MCP server at startup and becomes the *only*
-//! Figma MCP an agent needs — `tools/list` merges the 19 local `figmog_*`
+//! Figma MCP an agent needs — `tools/list` merges the 21 local `figmog_*`
 //! tools with every upstream tool verbatim (`proxy::merge_registry`), and
 //! `tools/call` routes by the namespace rule (`proxy::is_local_tool`).
 //! Upstream routing is global, not per-session: the desktop server serves
@@ -42,9 +42,14 @@
 //! re-probe: an unreachable upstream at startup means local-only tools
 //! for the life of the process.
 
-use std::io::{BufRead, Write};
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -80,6 +85,348 @@ fn clamp_interval(interval: u64) -> Duration {
     Duration::from_secs(interval.min(MAX_INTERVAL_SECS))
 }
 
+// ---- unix-socket control plane (v0.0.2 spec §1) ----
+//
+// `figmog serve` additionally listens on `<figmog-root>/serve.sock`: a
+// listener thread accepts connections, and each connection's own reader
+// thread forwards newline-delimited JSON-RPC frames into the *same* `mpsc`
+// channel the stdin reader already feeds — tagged with a connection id
+// (`Incoming::Socket`) so the single-threaded main loop below can route
+// each response back to the connection that asked for it. The store is
+// still only ever touched from the main loop; socket traffic, stdio
+// frames, and watch ticks all interleave through one `recv`/`recv_timeout`
+// exactly as they always have.
+
+/// One message the serve loop can receive from either its stdin reader
+/// thread or a socket connection's reader thread.
+#[derive(Debug)]
+enum Incoming {
+    /// One line of MCP stdio input.
+    Stdio(String),
+    /// Stdin hit EOF (or a read error): the reader thread is done and the
+    /// loop should exit. An explicit sentinel — rather than relying on
+    /// every `tx` clone being dropped, the pre-socket exit signal — because
+    /// once socket connections hold their own long-lived `tx` clones, the
+    /// channel no longer reliably disconnects just because stdin closed.
+    StdinClosed,
+    /// One line from socket connection `conn_id`.
+    Socket(u64, String),
+}
+
+/// Registry of a socket connection's write half, keyed by connection id —
+/// the main loop's only way to route a response back to the connection
+/// that asked for it (its own thread only ever *reads*; writing back
+/// happens from the main loop, which is the only place a `ToolHandler` may
+/// touch the store). An entry is removed the moment its reader thread ends
+/// (EOF or any read error — see [`spawn_socket_acceptor`]), so a client
+/// that vanishes mid-request simply has no entry left to write a response
+/// to by the time one's ready.
+type ConnRegistry = Arc<Mutex<HashMap<u64, UnixStream>>>;
+
+/// `<figmog_root>/serve.sock` — must match `cli::socket`'s own derivation
+/// exactly, since that's how the CLI finds this process.
+pub(crate) fn socket_path(figmog_root: &Path) -> PathBuf {
+    figmog_root.join("serve.sock")
+}
+
+/// Outcome of probing a pre-existing socket file at startup (spec §1).
+#[derive(Debug, PartialEq, Eq)]
+enum StaleProbe {
+    /// A connect succeeded: some other process is actively listening — this
+    /// instance must not touch the file.
+    Owned,
+    /// A connect failed: nothing is actually listening (a leftover file
+    /// from an unclean exit, or garbage that was never a socket at all) —
+    /// safe to unlink and rebind.
+    Stale,
+}
+
+/// Pure classification of a connect attempt against a pre-existing socket
+/// path, split from the actual `UnixStream::connect` call so the decision
+/// itself is unit-testable without a real socket. Spec §1 only names the
+/// two outcomes that matter in practice — refused (stale) vs. success
+/// (owned) — but *any* connect failure is treated as stale: a path that
+/// exists but isn't a live listening socket at all (garbage left by
+/// something else, or a filesystem error) means this instance can't reach
+/// a live owner through it either way, so it's safe to reclaim.
+fn classify_probe(connect_result: std::io::Result<()>) -> StaleProbe {
+    match connect_result {
+        Ok(()) => StaleProbe::Owned,
+        Err(_) => StaleProbe::Stale,
+    }
+}
+
+/// Generous but bounded: probing a pre-existing socket should resolve
+/// near-instantly (either the connect succeeds against a live listener or
+/// fails against a dead one) — this only guards against a pathological
+/// hang on a socket that accepts but never proceeds.
+const SOCKET_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Bind the control-plane socket at `<figmog_root>/serve.sock`, handling
+/// the startup stale-probe (spec §1): no file yet ⇒ bind directly; a file
+/// present ⇒ probe it via [`classify_probe`], unlinking and rebinding on
+/// [`StaleProbe::Stale`] or returning the clean "another serve owns this
+/// root" error on [`StaleProbe::Owned`] (`run_serve` surfaces this as an
+/// ordinary `Err`, which `cli::run`'s top-level handler turns into the
+/// standard `{"error": ...}` exit-1 JSON — spec §1: "exit with a clean JSON
+/// error"). Sets the socket file's mode to 0600 after binding, and
+/// `figmog_root` itself to 0700 (review m4): macOS in particular ignores a
+/// unix-domain socket *file's* mode for connect permission checks — the
+/// containing directory's mode is the real access boundary there, so
+/// tightening only the socket file would be closer to cosmetic than
+/// enforced on that platform. `figmog_root` may already exist (a prior
+/// session's store, or a re-bind) — the mode is set unconditionally either
+/// way, since every path that reaches this point is this process's own
+/// root to run as its owner sees fit.
+fn bind_socket(figmog_root: &Path) -> Result<(UnixListener, PathBuf), String> {
+    std::fs::create_dir_all(figmog_root)
+        .map_err(|e| format!("creating {}: {e}", figmog_root.display()))?;
+    let mut dir_perms = std::fs::metadata(figmog_root)
+        .map_err(|e| e.to_string())?
+        .permissions();
+    dir_perms.set_mode(0o700);
+    std::fs::set_permissions(figmog_root, dir_perms).map_err(|e| e.to_string())?;
+
+    let path = socket_path(figmog_root);
+
+    if path.exists() {
+        let connect_result = UnixStream::connect(&path).and_then(|stream| {
+            stream.set_read_timeout(Some(SOCKET_PROBE_TIMEOUT))?;
+            Ok(())
+        });
+        match classify_probe(connect_result) {
+            StaleProbe::Owned => {
+                return Err("another figmog serve owns this root".to_string());
+            }
+            StaleProbe::Stale => {
+                std::fs::remove_file(&path)
+                    .map_err(|e| format!("removing stale socket {}: {e}", path.display()))?;
+            }
+        }
+    }
+
+    let listener =
+        UnixListener::bind(&path).map_err(|e| format!("binding socket {}: {e}", path.display()))?;
+    let mut perms = std::fs::metadata(&path)
+        .map_err(|e| e.to_string())?
+        .permissions();
+    perms.set_mode(0o600);
+    std::fs::set_permissions(&path, perms).map_err(|e| e.to_string())?;
+    Ok((listener, path))
+}
+
+/// Unlinks the control-plane socket file on drop — but only if the file at
+/// `path` is still the *same inode* this process bound (review m3): a
+/// racer, or an operator manually `rm`-ing and recreating the path while
+/// this process ran, could otherwise cause this guard to delete a live
+/// socket that isn't this process's own. `(dev, ino)` is recorded right
+/// after a successful bind and re-checked at drop time via a fresh
+/// `stat` — cheap, and the only reliable way to answer "is this still my
+/// file" on a plain path (there's no unlink-by-fd primitive for a named
+/// unix socket). A `stat` failure at drop time (the path is already gone)
+/// is treated as nothing-to-do, not an error.
+///
+/// Every one of `run_serve`'s return points — a clean stdin-EOF exit, a
+/// watch-loop disconnect, a future early error after the socket was bound
+/// — drops this implicitly (it's held in a local binding for the rest of
+/// the function's scope), so "unlinked on clean exit" (spec §1) is
+/// structural rather than a set of hand-maintained cleanup calls at each
+/// return site. Never constructed for a probe that found another serve
+/// owning the root: [`bind_socket`] returns `Err` before creating one in
+/// that case, and that socket file is not this process's to remove.
+///
+/// Best-effort, not a hard guarantee: on filesystems that recycle inode
+/// numbers aggressively (ext4, notably — see the two-live-files-then-
+/// `rename(2)` construction the `socket_guard_does_not_unlink_a_file_
+/// replaced_at_the_same_path` test needs to reliably prove the *positive*
+/// case on Linux), an unlink immediately followed by an unrelated create at
+/// the exact same path could in principle land on the same `(dev, ino)`
+/// this guard bound, purely by chance — no attacker or racer required.
+/// This is an accepted, narrow gap in an already best-effort safety net
+/// (spec §1 has no auth story for the socket beyond filesystem
+/// permissions to begin with), not a design this crate tries to close
+/// further.
+struct SocketGuard {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+}
+
+impl SocketGuard {
+    fn new(path: PathBuf) -> Result<Self, String> {
+        let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+        Ok(SocketGuard {
+            path,
+            dev: meta.dev(),
+            ino: meta.ino(),
+        })
+    }
+}
+
+impl Drop for SocketGuard {
+    fn drop(&mut self) {
+        if let Ok(meta) = std::fs::metadata(&self.path)
+            && meta.dev() == self.dev
+            && meta.ino() == self.ino
+        {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// A single frame's hard ceiling (review m4): a client sending more than
+/// this without a newline is misbehaving (or hostile) and is disconnected
+/// rather than let grow this connection's read buffer without bound. Any
+/// real figmog request/response — including a large `figmog_subtree` dump
+/// — is orders of magnitude smaller than this.
+const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+
+/// Generous but bounded: a socket client that never reads what serve
+/// writes back (accidentally or maliciously) must not be able to stall
+/// this connection's response forever (review I1); well-behaved clients
+/// (the CLI's own `cli::socket`, any well-formed automation) read
+/// promptly and never come close to this. Set once per connection, at
+/// accept time, on a handle that's `dup()`-shared with every later
+/// `try_clone()` of the same connection (a unix-domain socket's send
+/// timeout is a property of the underlying OS socket, not of any one
+/// process-side handle to it), so [`write_socket_response`]'s later clones
+/// inherit it automatically.
+const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Read one newline-delimited frame from `reader`, capped at
+/// [`MAX_FRAME_BYTES`] (review m4). `Ok(None)` on a clean EOF with no
+/// partial data; `Err` on an oversized frame (no newline found within the
+/// cap) or any underlying I/O error — both mean "disconnect this
+/// connection", exactly like every other read failure in
+/// [`spawn_socket_acceptor`].
+fn read_bounded_line<R: BufRead>(reader: &mut R) -> std::io::Result<Option<String>> {
+    let mut buf = Vec::new();
+    // Driven directly off `fill_buf`/`consume` rather than `Take` wrapping
+    // `read_until`: a chunk can (and, with a client that pipelines several
+    // frames back-to-back, will) contain bytes past the newline — consuming
+    // only up through it, never the whole chunk, is what leaves the rest
+    // buffered for the *next* call to pick up as the start of the next
+    // frame, instead of dropping it.
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            break; // clean EOF
+        }
+        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+            buf.extend_from_slice(&available[..=pos]);
+            reader.consume(pos + 1);
+            break;
+        }
+        buf.extend_from_slice(available);
+        let consumed = available.len();
+        reader.consume(consumed);
+        if buf.len() > MAX_FRAME_BYTES {
+            return Err(std::io::Error::other(format!(
+                "frame exceeds {MAX_FRAME_BYTES} bytes with no newline"
+            )));
+        }
+    }
+    if buf.is_empty() {
+        return Ok(None);
+    }
+    while matches!(buf.last(), Some(b'\n' | b'\r')) {
+        buf.pop();
+    }
+    String::from_utf8(buf)
+        .map(Some)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// Accept loop for the control-plane socket, on its own thread: each
+/// connection gets its own reader thread forwarding newline-delimited
+/// frames (bounded per [`read_bounded_line`]) into `tx` tagged with a
+/// fresh connection id, with its write half — a non-blocking-forever send
+/// timeout applied ([`SOCKET_WRITE_TIMEOUT`]) — stored in `registry` first
+/// (so a request that arrives and is answered before the *next* line is
+/// even read still has somewhere to route its response). An accept, clone,
+/// or timeout-configuration failure for one connection is skipped rather
+/// than tearing down the whole listener — a transient per-connection
+/// hiccup shouldn't take the control plane down.
+fn spawn_socket_acceptor(
+    listener: UnixListener,
+    tx: mpsc::Sender<Incoming>,
+    registry: ConnRegistry,
+) {
+    std::thread::spawn(move || {
+        let next_id = AtomicU64::new(0);
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            let Ok(write_half) = stream.try_clone() else {
+                continue;
+            };
+            if write_half
+                .set_write_timeout(Some(SOCKET_WRITE_TIMEOUT))
+                .is_err()
+            {
+                continue;
+            }
+            let conn_id = next_id.fetch_add(1, Ordering::Relaxed);
+            registry.lock().unwrap().insert(conn_id, write_half);
+
+            let tx = tx.clone();
+            let registry = registry.clone();
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stream);
+                loop {
+                    match read_bounded_line(&mut reader) {
+                        Ok(None) => break,
+                        Ok(Some(l)) => {
+                            if tx.send(Incoming::Socket(conn_id, l)).is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                // The client disconnected (or sent something unreadable):
+                // drop its write half so a response computed just before
+                // this point (still in flight through `tx`) finds no entry
+                // to write to instead of writing into a dead socket.
+                registry.lock().unwrap().remove(&conn_id);
+            });
+        }
+    });
+}
+
+/// Write one response frame back to `conn_id`'s socket connection, if it's
+/// still registered — a client that vanished mid-request (its reader
+/// thread already removed the entry) simply has nothing to write to,
+/// matching every other "vanished client" path in this file: the response
+/// is dropped, not a panic and not a wedged loop. A write failure (the
+/// connection died, or [`SOCKET_WRITE_TIMEOUT`] elapsed against a
+/// non-reading client) removes the now-dead entry too, so a later response
+/// for the same id doesn't retry a broken pipe.
+///
+/// Review I1: the actual (bounded, per [`SOCKET_WRITE_TIMEOUT`]) write
+/// happens on a handle cloned *out from behind* the registry lock — cloning
+/// a `UnixStream` is a cheap `dup()`, not I/O — rather than while holding
+/// it. Holding the lock across a blocking write would stall every other
+/// connection's registry bookkeeping (a new connection's accept-time
+/// `insert`, another connection's disconnect-time `remove`) behind however
+/// long this one write takes to time out, on top of the (unavoidable,
+/// single-threaded-loop) delay to every other queued message this causes
+/// regardless.
+fn write_socket_response(registry: &ConnRegistry, conn_id: u64, resp: &Value) {
+    let stream = {
+        let reg = registry.lock().unwrap();
+        match reg.get(&conn_id).and_then(|s| s.try_clone().ok()) {
+            Some(s) => s,
+            None => return,
+        }
+    };
+
+    let text = resp.to_string();
+    let ok = writeln!(&stream, "{text}").is_ok() && (&stream).flush().is_ok();
+    if !ok {
+        registry.lock().unwrap().remove(&conn_id);
+    }
+}
+
 /// How long to wait before the next watch tick, given how many sessions
 /// are being round-robin polled: the full `interval` split evenly across
 /// them (so each file gets, on average, one Tier-3 poll per `interval`),
@@ -92,7 +439,8 @@ fn tick_deadline(interval: Duration, session_count: usize) -> Duration {
     (interval / session_count as u32).max(MIN_TICK_DEADLINE)
 }
 
-/// Run the MCP stdio server. `db_override` is the CLI's legacy `--db
+/// Run the MCP stdio server (plus, unless `no_socket`, the unix-socket
+/// control plane — spec §1). `db_override` is the CLI's legacy `--db
 /// <path>` escape hatch (pre-v4, single-session semantics preserved
 /// exactly — see `cli::dispatch`'s note on this branch); when absent,
 /// `files` (zero or more, `--figmog-root`-rooted) are each mirrored at
@@ -101,6 +449,7 @@ fn tick_deadline(interval: Duration, session_count: usize) -> Duration {
 /// native desktop MCP server at `upstream_url` as a cached proxy (build
 /// design §12); a failed probe degrades to local-only tools with one
 /// stderr line, never a hard error.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_serve(
     db_override: Option<PathBuf>,
     files: Vec<String>,
@@ -109,9 +458,49 @@ pub(crate) fn run_serve(
     upstream_url: String,
     no_upstream: bool,
     figmog_root: PathBuf,
+    no_socket: bool,
 ) -> Result<(), String> {
     let interval_dur = clamp_interval(interval);
     let token = std::env::var("FIGMA_TOKEN").ok();
+
+    // Bind the control-plane socket (spec §1) before anything else touches
+    // the filesystem for this run: a stale-probe conflict ("another figmog
+    // serve owns this root") should fail fast and unambiguously, never
+    // masked by an unrelated fjall store-lock panic from a session this
+    // process would otherwise go on to open first. `_socket_guard` is held
+    // for the rest of this function purely for its `Drop` impl (unlinking
+    // the socket file) — every return point below drops it implicitly.
+    let (tx, rx) = mpsc::channel::<Incoming>();
+    let registry: ConnRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let _socket_guard: Option<SocketGuard> = if no_socket {
+        None
+    } else {
+        let (listener, path) = bind_socket(&figmog_root)?;
+        let guard = SocketGuard::new(path)?;
+        spawn_socket_acceptor(listener, tx.clone(), registry.clone());
+        Some(guard)
+    };
+
+    // Reader thread: stdin lines -> mpsc, tagged `Incoming::Stdio` (see
+    // `Incoming`'s doc comment for why EOF now sends an explicit
+    // `StdinClosed` sentinel rather than relying on every `tx` clone being
+    // dropped).
+    {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            for line in std::io::stdin().lock().lines() {
+                match line {
+                    Ok(l) => {
+                        if tx.send(Incoming::Stdio(l)).is_err() {
+                            return;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let _ = tx.send(Incoming::StdinClosed);
+        });
+    }
 
     let (mut manager, track_current) = build_sessions(
         db_override,
@@ -155,51 +544,38 @@ pub(crate) fn run_serve(
     }
 
     eprintln!(
-        "{} serving {} file(s) (watch {}, upstream {upstream_status})",
+        "{} serving {} file(s) (watch {}, upstream {upstream_status}, socket {})",
         mcp::SERVER_NAME,
         manager.sessions.len(),
-        if no_watch { "off" } else { "on" }
+        if no_watch { "off" } else { "on" },
+        if no_socket { "off" } else { "on" }
     );
-
-    // Reader thread: stdin lines -> mpsc. EOF (or any read error) drops
-    // `tx`, which is how the main loop learns to exit (`recv`/`recv_timeout`
-    // return `Disconnected`).
-    let (tx, rx) = mpsc::channel::<String>();
-    std::thread::spawn(move || {
-        for line in std::io::stdin().lock().lines() {
-            match line {
-                Ok(l) => {
-                    if tx.send(l).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
 
     let mut next_session_idx: usize = 0;
     let mut next_deadline = Instant::now() + tick_deadline(interval_dur, manager.sessions.len());
 
     loop {
         let incoming = if no_watch {
-            // No ticking to do, so a disconnect (stdin EOF) is the only
-            // thing `recv` can report besides a line — exit clean rather
-            // than falling into the (watch-only) timeout branch below.
+            // No ticking to do, so a disconnect (all senders dropped — in
+            // practice unreachable once the socket is on, since the
+            // acceptor thread holds its own `tx` clone forever, but still
+            // handled) is the only other thing `recv` can report besides a
+            // message — exit clean rather than falling into the
+            // (watch-only) timeout branch below.
             match rx.recv() {
-                Ok(line) => Some(line),
+                Ok(msg) => Some(msg),
                 Err(mpsc::RecvError) => return Ok(()),
             }
         } else {
             let wait = next_deadline.saturating_duration_since(Instant::now());
             match rx.recv_timeout(wait) {
-                Ok(line) => Some(line),
+                Ok(msg) => Some(msg),
                 Err(mpsc::RecvTimeoutError::Timeout) => None,
                 Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
             }
         };
 
-        let Some(line) = incoming else {
+        let Some(msg) = incoming else {
             // Timeout with watch enabled: round-robin one session's meta
             // poll, pulling inline on change (spec §14).
             next_deadline = watch_tick(
@@ -209,6 +585,31 @@ pub(crate) fn run_serve(
                 track_current,
             );
             continue;
+        };
+
+        let line = match msg {
+            Incoming::StdinClosed => return Ok(()),
+            Incoming::Stdio(l) => l,
+            Incoming::Socket(conn_id, l) => {
+                let mut handler =
+                    FnHandler(|name: &str, args: &Value| -> Result<ToolOutput, String> {
+                        handle_tool_call(
+                            &mut manager,
+                            &mut upstream,
+                            upstream_status,
+                            no_watch,
+                            track_current,
+                            interval_dur,
+                            &mut next_deadline,
+                            name,
+                            args,
+                        )
+                    });
+                if let Some(resp) = mcp::handle_message(&l, &tools, &mut handler) {
+                    write_socket_response(&registry, conn_id, &resp);
+                }
+                continue;
+            }
         };
 
         let mut handler = FnHandler(|name: &str, args: &Value| -> Result<ToolOutput, String> {
@@ -302,7 +703,9 @@ fn build_sessions(
         if !no_watch {
             let session = &mut manager.sessions[0];
             if !session.mirrored {
-                sessions::do_pull(session, interval).map_err(|(message, _wait)| message)?;
+                // No user-facing geometry flag at startup (spec §4) — the
+                // mirror's stored setting, if any, still drives this.
+                sessions::do_pull(session, interval, false).map_err(|(message, _wait)| message)?;
             }
         }
         // `--db` never resolves a tracked key (pre-v4: `resolve_db`
@@ -333,7 +736,9 @@ fn build_sessions(
         let session = manager.open(f)?;
         let key = session.key.clone();
         let just_pulled = if !no_watch && !session.mirrored {
-            sessions::do_pull(session, interval).map_err(|(message, _wait)| message)?;
+            // No user-facing geometry flag at startup (spec §4) — the
+            // mirror's stored setting, if any, still drives this.
+            sessions::do_pull(session, interval, false).map_err(|(message, _wait)| message)?;
             true
         } else {
             false
@@ -387,7 +792,10 @@ fn watch_tick(
     match session.watcher.tick(&api, &key) {
         Tick::Unchanged => Instant::now() + deadline,
         Tick::Wait { after } => Instant::now() + after,
-        Tick::Changed => match sessions::do_pull(session, interval) {
+        // A background watch tick carries no user-facing geometry flag
+        // (spec §4) — the mirror's stored setting, if any, still drives
+        // this.
+        Tick::Changed => match sessions::do_pull(session, interval, false) {
             Ok(_outcome) => {
                 refresh_current(manager, track_current, &key);
                 Instant::now() + deadline
@@ -440,8 +848,14 @@ fn handle_tool_call(
 
     if name == "figmog_open" {
         let file = dispatch::require_str(args, "file")?;
+        // spec §4: `geometry` turns sticky vector-geometry requests on for
+        // this mirror going forward; omitted preserves whatever's already
+        // stored (default false for a brand-new mirror) — `do_pull`'s
+        // stored-flag union handles that, so `false` here is exactly "no
+        // new override" rather than "force off".
+        let geometry = dispatch::arg_bool(args, "geometry");
         let session = manager.open(&file)?;
-        let outcome = match sessions::do_pull(session, interval) {
+        let outcome = match sessions::do_pull(session, interval, geometry) {
             Ok(outcome) => outcome,
             Err((message, wait)) => {
                 *next_deadline = Instant::now() + wait;
@@ -470,7 +884,16 @@ fn handle_tool_call(
         })));
     }
 
-    let file_arg = args.get("file").and_then(Value::as_str).map(str::to_string);
+    // spec §2b: an explicit `file` arg always wins, but when it's absent
+    // and the call's node-id-shaped argument (`id`/`under`/`target`) is a
+    // full Figma URL naming a file, that URL's file key routes the call
+    // (auto-open semantics apply, same as an explicit `file`). When both
+    // are present and disagree, the explicit arg still wins — the
+    // disagreement is only surfaced as a note on a not-found error below,
+    // never silently overridden the other way.
+    let explicit_file = args.get("file").and_then(Value::as_str).map(str::to_string);
+    let url_file_key = dispatch::infer_file_from_node_ref(args);
+    let file_arg = explicit_file.clone().or_else(|| url_file_key.clone());
     let mut call_args = args.clone();
     if let Some(obj) = call_args.as_object_mut() {
         obj.remove("file");
@@ -487,13 +910,31 @@ fn handle_tool_call(
                     e.message
                 })?;
 
+        if name == "figmog_images" {
+            // v0.0.2 spec §5: never automatic, and this is the only place
+            // that reaches `FileSession::images` — no other call site
+            // wires it in. `resolve` already spends this session's cache
+            // and, on a miss, its Figma API budget; a pull failure has no
+            // analog here (images doesn't pull the file), so unlike
+            // `figmog_sync`/`figmog_open` this never touches
+            // `next_deadline`.
+            let ids = dispatch::require_str_array(args, "ids")?;
+            let format = args.get("format").and_then(Value::as_str).unwrap_or("png");
+            let scale = dispatch::arg_f64(args, "scale");
+            let items = (session.images)(&ids, format, scale)?;
+            return Ok(ToolOutput::Raw(crate::images::to_mcp_content(&items)));
+        }
+
         if name == "figmog_sync" {
             // `resolve` already spent this call's one pull if the session
             // was new/unmirrored — skip the redundant second Tier-1 pull
             // `figmog_sync` would otherwise always perform.
             let outcome = match just_pulled {
                 Some(outcome) => outcome,
-                None => match sessions::do_pull(session, interval) {
+                // `figmog_sync` carries no geometry arg of its own (spec
+                // §4) — the mirror's stored setting, if any, still drives
+                // this re-pull.
+                None => match sessions::do_pull(session, interval, false) {
                     Ok(outcome) => outcome,
                     Err((message, wait)) => {
                         *next_deadline = Instant::now() + wait;
@@ -507,7 +948,30 @@ fn handle_tool_call(
             return Ok(ToolOutput::Json(churn_value));
         }
 
-        let result = (session.dispatch)(name, &call_args)?;
+        let result = (session.dispatch)(name, &call_args).map_err(|msg| {
+            // spec §2b: note an explicit-file/URL-file disagreement on a
+            // failed call (almost always "no node ... in the mirror" —
+            // the node genuinely isn't in the file the explicit arg
+            // picked) rather than staying silent about why a URL that
+            // looks right didn't resolve. `explicit_file` is compared by
+            // its *normalized* key, not its raw text — it can itself be a
+            // full Figma URL (or a bare key) naming the very same file
+            // `url_file_key` already extracted, and a raw-string compare
+            // would false-positive on that (same file, different spelling).
+            // A `file` arg `parse_file_ref` can't make sense of at all
+            // falls back to the raw text so a genuine mismatch still shows.
+            let explicit_key = explicit_file
+                .as_deref()
+                .map(|f| parse_file_ref(f).unwrap_or_else(|| f.to_string()));
+            match (&explicit_key, &url_file_key) {
+                (Some(ef), Some(uf)) if ef != uf => {
+                    format!(
+                        "{msg} (note: the id/under URL names file {uf}, but the explicit `file` argument {ef} was used instead)"
+                    )
+                }
+                _ => msg,
+            }
+        })?;
         if name == "figmog_status"
             && let ToolOutput::Json(mut v) = result
         {
@@ -564,10 +1028,10 @@ mod tests {
         })]);
         let (tools, dropped) = proxy::merge_registry(local_registry(), upstream.tools());
         assert!(dropped.is_empty());
-        assert_eq!(tools.len(), 20);
-        assert!(tools[..19].iter().all(|t| t.name.starts_with("figmog_")));
-        assert_eq!(tools[19].name, "get_design_context");
-        assert!(tools[19].description.starts_with("[via Figma desktop] "));
+        assert_eq!(tools.len(), 22);
+        assert!(tools[..21].iter().all(|t| t.name.starts_with("figmog_")));
+        assert_eq!(tools[21].name, "get_design_context");
+        assert!(tools[21].description.starts_with("[via Figma desktop] "));
     }
 
     #[test]
@@ -636,6 +1100,314 @@ mod tests {
         assert_eq!(
             tick_deadline(Duration::from_secs(10), 100),
             Duration::from_secs(2)
+        );
+    }
+
+    // ---- unix-socket control plane (v0.0.2 spec §1) ----
+
+    #[test]
+    fn classify_probe_connect_success_means_owned() {
+        assert_eq!(classify_probe(Ok(())), StaleProbe::Owned);
+    }
+
+    #[test]
+    fn classify_probe_connection_refused_means_stale() {
+        let err = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+        assert_eq!(classify_probe(Err(err)), StaleProbe::Stale);
+    }
+
+    #[test]
+    fn classify_probe_any_other_connect_error_also_means_stale() {
+        // A path that exists but isn't a live listening socket at all
+        // (garbage, or some other filesystem error) is treated the same
+        // as a refused connection — see `classify_probe`'s doc comment.
+        let err = std::io::Error::other("not a socket");
+        assert_eq!(classify_probe(Err(err)), StaleProbe::Stale);
+    }
+
+    #[test]
+    fn incoming_messages_carry_their_connection_tag_through_the_channel() {
+        // Proves the tagging/routing mechanism itself: several sources
+        // (stdin, two different socket connections) share one channel, and
+        // each `Incoming` value on the receiving end still carries enough
+        // information to route a response back to the right place.
+        let (tx, rx) = mpsc::channel::<Incoming>();
+        tx.send(Incoming::Stdio("stdio line".to_string())).unwrap();
+        tx.send(Incoming::Socket(7, "first conn".to_string()))
+            .unwrap();
+        tx.send(Incoming::Socket(9, "second conn".to_string()))
+            .unwrap();
+        tx.send(Incoming::StdinClosed).unwrap();
+
+        match rx.recv().unwrap() {
+            Incoming::Stdio(l) => assert_eq!(l, "stdio line"),
+            other => panic!("expected Stdio, got {other:?}"),
+        }
+        match rx.recv().unwrap() {
+            Incoming::Socket(id, l) => {
+                assert_eq!(id, 7);
+                assert_eq!(l, "first conn");
+            }
+            other => panic!("expected Socket(7, ..), got {other:?}"),
+        }
+        match rx.recv().unwrap() {
+            Incoming::Socket(id, l) => {
+                assert_eq!(id, 9);
+                assert_eq!(l, "second conn");
+            }
+            other => panic!("expected Socket(9, ..), got {other:?}"),
+        }
+        assert!(matches!(rx.recv().unwrap(), Incoming::StdinClosed));
+    }
+
+    #[test]
+    fn write_socket_response_delivers_to_the_registered_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = UnixStream::connect(&path).unwrap();
+        let (server_side, _) = listener.accept().unwrap();
+
+        let registry: ConnRegistry = Arc::new(Mutex::new(HashMap::new()));
+        registry.lock().unwrap().insert(1, server_side);
+
+        write_socket_response(&registry, 1, &json!({"hello": "world"}));
+
+        let mut reader = BufReader::new(client);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let v: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v, json!({"hello": "world"}));
+        // The write succeeded, so the entry is still there for a
+        // subsequent response on the same connection.
+        assert!(registry.lock().unwrap().contains_key(&1));
+    }
+
+    #[test]
+    fn write_socket_response_for_an_unregistered_connection_is_a_silent_no_op() {
+        // A response for a connection id that was never registered (or
+        // whose entry was already removed — the client vanished) must not
+        // panic; the response is simply dropped.
+        let registry: ConnRegistry = Arc::new(Mutex::new(HashMap::new()));
+        write_socket_response(&registry, 999, &json!({"ignored": true}));
+        assert!(registry.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn bind_socket_creates_a_0600_file_and_a_second_probe_sees_it_as_owned() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let (listener, path) = bind_socket(&root).expect("first bind should succeed");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "socket file should be mode 0600");
+
+        // A second bind attempt against the same root, with the first
+        // listener still alive, must classify the existing file as owned
+        // (spec §1: "success ⇒ another serve owns this root") rather than
+        // stealing it.
+        let err = bind_socket(&root).unwrap_err();
+        assert!(err.contains("another figmog serve owns this root"), "{err}");
+
+        drop(listener);
+    }
+
+    #[test]
+    fn bind_socket_unlinks_and_rebinds_a_stale_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        // A leftover regular file at the socket path, with nothing
+        // listening — the simplest reproduction of a stale socket from an
+        // unclean exit.
+        std::fs::write(socket_path(&root), b"not a socket").unwrap();
+
+        let (listener, _path) = bind_socket(&root).expect("stale file should be reclaimed");
+        drop(listener);
+    }
+
+    #[test]
+    fn bind_socket_sets_the_root_dir_mode_to_0700() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let (listener, _path) = bind_socket(&root).unwrap();
+        let mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "figmog-root should be tightened to 0700");
+        drop(listener);
+    }
+
+    // ---- review fix round: C1/C2/m1-m6 ----
+
+    #[test]
+    fn socket_guard_does_not_unlink_a_file_replaced_at_the_same_path() {
+        // Simulates a racer, or an operator manually `rm`-ing and
+        // recreating the socket path while serve is still running (m3):
+        // the guard must check the file is still the *inode* it bound, not
+        // just that "something" exists at the path, before removing it.
+        //
+        // The replacement is built at a *sibling* path while the original
+        // still exists, then moved over the guard's path with `rename(2)`
+        // — the only way to guarantee a genuinely different inode across
+        // platforms. A plain remove-then-recreate at the same path doesn't
+        // reliably do that: ext4 (the common Linux CI filesystem) recycles
+        // inode numbers immediately, so a delete-then-recreate at the same
+        // path can legitimately land on the exact same inode the guard
+        // bound — which would make this test pass for the wrong reason on
+        // Linux (or, as originally written, fail there outright, since two
+        // *simultaneously live* files are guaranteed distinct inodes but a
+        // remove-then-recreate isn't). `rename(2)` preserves the source
+        // inode across the move, so the file at `path` afterward is
+        // provably not the guard's original inode, on every platform.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let (listener, path) = bind_socket(&root).unwrap();
+        let guard = SocketGuard::new(path.clone()).unwrap();
+        drop(listener);
+
+        let replacement = dir.path().join("replacement");
+        std::fs::write(&replacement, b"someone else's file now").unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+
+        drop(guard);
+
+        assert!(
+            path.exists(),
+            "the guard must not remove a file it didn't itself create"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "someone else's file now"
+        );
+    }
+
+    #[test]
+    fn socket_guard_unlinks_its_own_untouched_socket_file() {
+        // The ordinary case, pinned alongside the "don't touch a replaced
+        // file" regression above so the two behaviors stay in view
+        // together.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let (listener, path) = bind_socket(&root).unwrap();
+        let guard = SocketGuard::new(path.clone()).unwrap();
+        drop(listener);
+
+        drop(guard);
+
+        assert!(
+            !path.exists(),
+            "the guard should remove its own socket file"
+        );
+    }
+
+    #[test]
+    fn read_bounded_line_returns_ok_none_on_clean_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = UnixStream::connect(&path).unwrap();
+        let (server_side, _) = listener.accept().unwrap();
+        drop(client); // EOF from the server's read side, no data ever sent.
+
+        let mut reader = BufReader::new(server_side);
+        assert_eq!(read_bounded_line(&mut reader).unwrap(), None);
+    }
+
+    #[test]
+    fn read_bounded_line_splits_multiple_pipelined_frames_from_one_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let mut client = UnixStream::connect(&path).unwrap();
+        let (server_side, _) = listener.accept().unwrap();
+
+        // Two frames written in one `write_all` call, arriving as (very
+        // likely) one chunk from the reader's perspective — proving
+        // `read_bounded_line` only consumes up through the first newline,
+        // leaving the second frame's bytes buffered for the next call
+        // rather than dropping them.
+        client.write_all(b"first\nsecond\n").unwrap();
+
+        let mut reader = BufReader::new(server_side);
+        assert_eq!(
+            read_bounded_line(&mut reader).unwrap(),
+            Some("first".to_string())
+        );
+        assert_eq!(
+            read_bounded_line(&mut reader).unwrap(),
+            Some("second".to_string())
+        );
+    }
+
+    #[test]
+    fn read_bounded_line_disconnects_on_an_oversized_frame() {
+        // review m4: a line with no newline that exceeds `MAX_FRAME_BYTES`
+        // must error (disconnect the connection) rather than growing the
+        // buffer without bound.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let mut client = UnixStream::connect(&path).unwrap();
+        let (server_side, _) = listener.accept().unwrap();
+
+        let oversized = vec![b'a'; MAX_FRAME_BYTES + 1];
+        let writer = std::thread::spawn(move || {
+            // Never completes the frame with a newline — the reader must
+            // give up once the cap is exceeded, not once EOF arrives.
+            let _ = client.write_all(&oversized);
+        });
+
+        let mut reader = BufReader::new(server_side);
+        let result = read_bounded_line(&mut reader);
+        assert!(
+            result.is_err(),
+            "an oversized frame should error, not block forever collecting it"
+        );
+
+        let _ = writer.join();
+    }
+
+    #[test]
+    fn write_socket_response_disconnects_a_non_reading_client_within_a_bounded_time() {
+        // review I1: a client that never drains what serve writes back
+        // must not be able to hang `write_socket_response` (and therefore
+        // the single-threaded main loop) forever. A short write timeout —
+        // independent of the production `SOCKET_WRITE_TIMEOUT`, which
+        // stays generous for real clients — proves the *mechanism*
+        // (bounded write ⇒ disconnect ⇒ registry cleanup) without waiting
+        // out the production timeout in a unit test.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let _client = UnixStream::connect(&path).unwrap(); // never read from
+        let (server_side, _) = listener.accept().unwrap();
+        server_side
+            .set_write_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+
+        let registry: ConnRegistry = Arc::new(Mutex::new(HashMap::new()));
+        registry.lock().unwrap().insert(1, server_side);
+
+        // A sizeable payload, written repeatedly with nothing ever
+        // draining the client's receive buffer: the OS socket buffer WILL
+        // fill eventually (its exact size varies by platform, so this
+        // doesn't assume a specific threshold) and a subsequent write
+        // times out. Bounded overall by the loop's own deadline — if
+        // `write_socket_response` ever blocked indefinitely (the pre-fix
+        // behavior), this loop would hang the test past that deadline
+        // instead of completing.
+        let big = json!({"padding": "x".repeat(64 * 1024)});
+        let start = Instant::now();
+        while registry.lock().unwrap().contains_key(&1) && start.elapsed() < Duration::from_secs(10)
+        {
+            write_socket_response(&registry, 1, &big);
+        }
+
+        assert!(
+            !registry.lock().unwrap().contains_key(&1),
+            "a non-reading client's connection should eventually be dropped, not held forever"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "write_socket_response must not block indefinitely on a non-reading client"
         );
     }
 }

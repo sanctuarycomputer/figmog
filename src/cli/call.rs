@@ -113,7 +113,11 @@ pub(super) fn cmd_call(
     // second handle for `figmog_sync`, since it reuses its own long-lived
     // `st` instead of calling `do_pull`).
     if tool == "figmog_sync" {
-        let result = do_pull(db, None, None, false)
+        // `geometry: false` here means "no new override" — `do_pull`
+        // internally unions this with whatever's already stored (spec §4
+        // stickiness), so a plain `figmog_sync` still re-requests geometry
+        // for a mirror that was ever pulled with `--geometry`.
+        let result = do_pull(db, None, None, false, false)
             .map(|(churn, _name, _version)| serde_json::to_value(&churn).unwrap_or_default())
             .map_err(|e| e.to_string());
         return print_call_result(result);
@@ -133,7 +137,7 @@ pub(super) fn cmd_call(
             .ok_or_else(|| format!("upstream not attached: {tool}"))?;
         let args_canonical = proxy::canonical_args(&args)?;
         let version_and_hit = if proxy::is_cacheable(&tool, &args) {
-            st.rtx(|(_, _, _, _, _, _, meta, cache)| {
+            st.rtx(|(_, _, _, _, _, _, meta, cache, _, _)| {
                 let version = meta.get(&0).map(|m| m.version.clone());
                 let hit = version
                     .as_ref()

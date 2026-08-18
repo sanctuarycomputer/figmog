@@ -146,17 +146,26 @@ pub fn infer_from_nodes<'a>(nodes: impl Iterator<Item = &'a NodeRec>) -> Vec<Var
         .collect()
 }
 
+/// The raw-JSON pointer prefix a style type's definition lives under on a
+/// consumer node, shared by [`style_value_from_consumer`] (the definition
+/// itself) and `query::styles`'s `resolve_vars` path (which variable
+/// bindings belong to that definition — a binding's own pointer, e.g.
+/// `/fills/0/color`, starts with this prefix).
+pub fn style_value_pointer(style_type: &str) -> Option<&'static str> {
+    match style_type {
+        "TEXT" => Some("/style"),
+        "FILL" => Some("/fills"),
+        "EFFECT" => Some("/effects"),
+        "GRID" => Some("/layoutGrids"),
+        _ => None,
+    }
+}
+
 /// Derive a style's definition from one consumer node's raw JSON.
 /// Style definitions are not in the file JSON; consumers carry the
 /// resolved properties.
 pub fn style_value_from_consumer(style_type: &str, consumer_raw: &str) -> Option<Value> {
     let raw: Value = serde_json::from_str(consumer_raw).ok()?;
-    let pointer = match style_type {
-        "TEXT" => "/style",
-        "FILL" => "/fills",
-        "EFFECT" => "/effects",
-        "GRID" => "/layoutGrids",
-        _ => return None,
-    };
+    let pointer = style_value_pointer(style_type)?;
     raw.pointer(pointer).cloned()
 }

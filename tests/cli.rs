@@ -70,6 +70,156 @@ fn pull_from_file_reports_churn_and_is_idempotent() {
     assert_eq!(v["added"], 0);
 }
 
+// ---- sticky vector geometry (v0.0.2 spec §4) ----
+
+/// `pull --geometry` with a fixture that carries `fillGeometry` (what a
+/// real `?geometry=paths` fetch would return on a vector node) keeps that
+/// data in the node's raw JSON — `flatten`'s `raw` field is unknown-field-
+/// preserving, so this is really proving the CLI plumbing (the flag
+/// doesn't get stripped or cause an error) rather than the network
+/// request itself, which `--from-file` never issues (see
+/// `figmog::api::file_url`'s own unit tests for that half).
+#[test]
+fn pull_geometry_flag_keeps_fill_geometry_in_raw() {
+    let dir = tempfile::tempdir().unwrap();
+    let response = dir.path().join("resp.json");
+    std::fs::write(
+        &response,
+        serde_json::to_string(&common::fixture_with_geometry()).unwrap(),
+    )
+    .unwrap();
+    let db = dir.path().join("db").display().to_string();
+
+    Command::cargo_bin("figmog")
+        .unwrap()
+        .args([
+            "pull",
+            "--from-file",
+            response.to_str().unwrap(),
+            "--geometry",
+            "--db",
+            &db,
+        ])
+        .assert()
+        .success();
+
+    let out = Command::cargo_bin("figmog")
+        .unwrap()
+        .args(["get", "1:1", "--db", &db])
+        .assert()
+        .success();
+    let node: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert!(
+        node["fillGeometry"].is_array(),
+        "fillGeometry must survive into raw: {node}"
+    );
+}
+
+/// The stored half of stickiness (spec §4): a `--geometry` pull persists
+/// the flag, and a later *plain* re-pull (no `--geometry`) must not clear
+/// it. The actual network request choice this drives is proven separately
+/// and purely (`store::tests::effective_geometry_is_sticky_once_either_
+/// side_is_true`, `api::tests::file_url_adds_geometry_paths_only_when_
+/// requested`) — `--from-file` never issues a request to inspect, so this
+/// test proves the persisted config survives an ordinary re-pull
+/// end-to-end instead. Reads the stored config directly off the store
+/// (there's no CLI-surfaced way to read `mirror_config`), dropping each
+/// handle before the next `figmog` subprocess reopens the same store —
+/// fjall allows only one open per store per process at a time.
+#[test]
+fn pull_geometry_flag_is_sticky_across_a_later_plain_pull() {
+    let dir = tempfile::tempdir().unwrap();
+    let response = dir.path().join("resp.json");
+    std::fs::write(
+        &response,
+        serde_json::to_string(&common::fixture_v1()).unwrap(),
+    )
+    .unwrap();
+    let db_path = dir.path().join("db");
+    let db = db_path.display().to_string();
+
+    Command::cargo_bin("figmog")
+        .unwrap()
+        .args([
+            "pull",
+            "--from-file",
+            response.to_str().unwrap(),
+            "--geometry",
+            "--db",
+            &db,
+        ])
+        .assert()
+        .success();
+    {
+        let st = figmog::open_store!(&db_path);
+        let stored = st.rtx(|(.., mirror_config, _)| figmog::store::read_geometry(&mirror_config));
+        assert!(stored, "the --geometry pull must persist the flag");
+    }
+
+    Command::cargo_bin("figmog")
+        .unwrap()
+        .args([
+            "pull",
+            "--from-file",
+            response.to_str().unwrap(),
+            "--db",
+            &db,
+        ])
+        .assert()
+        .success();
+    {
+        let st = figmog::open_store!(&db_path);
+        let still_stored =
+            st.rtx(|(.., mirror_config, _)| figmog::store::read_geometry(&mirror_config));
+        assert!(still_stored, "a plain re-pull must not turn geometry off");
+    }
+}
+
+/// The documented way back off (spec §4): `--fresh` wipes the store, so a
+/// subsequent plain pull's config starts over at `false`.
+#[test]
+fn pull_fresh_turns_geometry_back_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let response = dir.path().join("resp.json");
+    std::fs::write(
+        &response,
+        serde_json::to_string(&common::fixture_v1()).unwrap(),
+    )
+    .unwrap();
+    let db_path = dir.path().join("db");
+    let db = db_path.display().to_string();
+
+    Command::cargo_bin("figmog")
+        .unwrap()
+        .args([
+            "pull",
+            "--from-file",
+            response.to_str().unwrap(),
+            "--geometry",
+            "--db",
+            &db,
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("figmog")
+        .unwrap()
+        .args([
+            "pull",
+            "--from-file",
+            response.to_str().unwrap(),
+            "--fresh",
+            "--db",
+            &db,
+        ])
+        .assert()
+        .success();
+
+    let st = figmog::open_store!(&db_path);
+    let stored = st.rtx(|(.., mirror_config, _)| figmog::store::read_geometry(&mirror_config));
+    assert!(!stored, "--fresh must reset the sticky geometry flag");
+}
+
 #[test]
 fn status_pages_tree_get_find() {
     let (_dir, db) = fixture_db();
@@ -322,6 +472,64 @@ fn parent_cycle_does_not_hang_path_or_stats() {
         .success();
 }
 
+/// The same hand-upserted 2-node mutual-parent construction as
+/// `parent_cycle_does_not_hang_path_or_stats` above also derives a
+/// `children`-multimap cycle (`store::child_edge` feeds `children` off
+/// each node's own `parent_id`, so A:1's parent B:1 and B:1's parent A:1
+/// produce mutual `children` edges too) — `--under`'s BFS
+/// (`query::scope_ids`) must not hang on it, same "runs inside `figmog
+/// serve`'s single-threaded loop" stakes as the parent-cycle case.
+#[test]
+fn children_cycle_does_not_hang_under_scoping() {
+    use figmog::model::{Id, NodeRec, Rec};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db");
+    let mut st = figmog::open_store!(&db);
+    let node = |id: &str, parent: &str| NodeRec {
+        id: id.into(),
+        parent_id: Some(parent.into()),
+        child_index: 0,
+        page_id: "0:1".into(),
+        node_type: "FRAME".into(),
+        name: id.into(),
+        visible: true,
+        text: None,
+        component_id: None,
+        component_properties: vec![],
+        property_definitions: None,
+        style_refs: vec![],
+        bound_variables: vec![],
+        abs_bounds: None,
+        raw: "{}".into(),
+    };
+    st.wtx(|tx| {
+        tx.upsert(&Id::Node("A:1".into()), &Rec::Node(node("A:1", "B:1")));
+        tx.upsert(&Id::Node("B:1".into()), &Rec::Node(node("B:1", "A:1")));
+    });
+    drop(st); // release the store lock before the child process opens it
+
+    let db = db.display().to_string();
+
+    let out = Command::cargo_bin("figmog")
+        .unwrap()
+        .args(["find", "--type", "FRAME", "--under", "A:1", "--db", &db])
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let ids: Vec<&str> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["A:1", "B:1"],
+        "BFS terminates and still finds both cyclic nodes"
+    );
+}
+
 #[test]
 fn import_variables_upgrades_vars_to_authoritative() {
     let (dir, db) = fixture_db();
@@ -375,8 +583,9 @@ fn import_variables_output_shape_is_the_variable_count_alone() {
 
 /// M6 (spec §4 debt ledger): `figmog tools`' JSON output shape — an array
 /// with one `{name, source, cacheable}` row per tool, nothing more.
-/// `--no-upstream` keeps this offline and deterministic: exactly the 19
-/// local `figmog_*` tools, every one `source: "local"`.
+/// `--no-upstream` keeps this offline and deterministic: exactly the 21
+/// local `figmog_*` tools (v0.0.2 §2 added `figmog_subtree`, §5 added
+/// `figmog_images`), every one `source: "local"`.
 #[test]
 fn tools_output_shape_is_name_source_cacheable_rows() {
     let out = Command::cargo_bin("figmog")
@@ -386,7 +595,7 @@ fn tools_output_shape_is_name_source_cacheable_rows() {
         .success();
     let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
     let rows = v.as_array().expect("tools output is a JSON array");
-    assert_eq!(rows.len(), 19, "19 local figmog_* tools, no upstream");
+    assert_eq!(rows.len(), 21, "21 local figmog_* tools, no upstream");
     for row in rows {
         let obj = row.as_object().expect("each row is a JSON object");
         let keys: std::collections::BTreeSet<&str> = obj.keys().map(String::as_str).collect();
@@ -541,7 +750,7 @@ fn cli_pull_evicts_stale_cache_rows_on_version_change() {
             &serde_json::json!({"cached": true}),
         )
         .unwrap();
-        let hit = st.rtx(|(_, _, _, _, _, _, _, cache_reader)| {
+        let hit = st.rtx(|(_, _, _, _, _, _, _, cache_reader, _, _)| {
             cache::lookup(&cache_reader, "get_code", "{}", "100")
         });
         assert!(
@@ -571,7 +780,7 @@ fn cli_pull_evicts_stale_cache_rows_on_version_change() {
         .success();
 
     let st = figmog::open_store!(&db);
-    let evicted = st.rtx(|(_, _, _, _, _, _, _, cache_reader)| {
+    let evicted = st.rtx(|(_, _, _, _, _, _, _, cache_reader, _, _)| {
         cache::lookup(&cache_reader, "get_code", "{}", "100")
     });
     assert_eq!(
@@ -663,5 +872,533 @@ fn json_flag_is_rejected_as_unknown() {
     assert!(
         stderr.contains("--json") || stderr.to_lowercase().contains("unexpected argument"),
         "expected clap to reject the removed --json flag: {stderr}"
+    );
+}
+
+// ---- v0.0.2 §2: subtree dump ----
+
+#[test]
+fn dump_full_raw_json_nested_recursively_with_depth_and_fields_projection() {
+    let (_dir, db) = fixture_db();
+    let run = |args: &[&str]| {
+        let out = Command::cargo_bin("figmog")
+            .unwrap()
+            .args(args)
+            .args(["--db", &db])
+            .assert()
+            .success();
+        serde_json::from_slice::<serde_json::Value>(&out.get_output().stdout).unwrap()
+    };
+
+    // Unbounded depth (default): full raw JSON, children nested in
+    // child-index order.
+    let dump = run(&["dump", "1:1"]);
+    assert_eq!(dump["id"], "1:1");
+    assert_eq!(dump["layoutMode"], "VERTICAL"); // raw field preserved verbatim
+    let kids = dump["children"].as_array().unwrap();
+    assert_eq!(kids.len(), 2);
+    assert_eq!(kids[0]["id"], "1:2"); // Title, numeric child order
+    assert_eq!(kids[0]["characters"], "Welcome to the garden");
+    assert_eq!(kids[1]["id"], "1:3"); // Button
+
+    // depth 0: the node itself only; `children` is still present, just empty.
+    let dump0 = run(&["dump", "1:1", "--depth", "0"]);
+    assert_eq!(dump0["children"], serde_json::json!([]));
+    assert_eq!(dump0["layoutMode"], "VERTICAL");
+
+    // depth 1 from the page: one level down, grandchildren cut off.
+    let dump1 = run(&["dump", "0:1", "--depth", "1"]);
+    let page_kids = dump1["children"].as_array().unwrap();
+    assert_eq!(page_kids.len(), 2); // Hero (1:1), Old badge (1:9)
+    assert_eq!(page_kids[0]["id"], "1:1");
+    assert_eq!(
+        page_kids[0]["children"],
+        serde_json::json!([]),
+        "depth exhausted before Hero's own children"
+    );
+
+    // fields projection: only requested fields plus the always-kept set
+    // (id/name/type/children) survive.
+    let projected = run(&["dump", "1:1", "--fields", "layoutMode"]);
+    let keys: std::collections::BTreeSet<&str> = projected
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        ["id", "name", "type", "children", "layoutMode"]
+            .into_iter()
+            .collect(),
+        "fields projection keeps id/name/type/children always, plus requested fields"
+    );
+    assert_eq!(
+        projected["children"][0]["layoutMode"],
+        serde_json::Value::Null
+    );
+
+    // Unknown field names are silently absent, not an error.
+    let unknown = run(&["dump", "1:1", "--fields", "notAField"]);
+    assert!(!unknown.as_object().unwrap().contains_key("notAField"));
+    assert_eq!(unknown["id"], "1:1"); // still always-kept
+}
+
+#[test]
+fn dump_unknown_node_fails_cleanly() {
+    let (_dir, db) = fixture_db();
+    let out = Command::cargo_bin("figmog")
+        .unwrap()
+        .args(["dump", "99:99", "--db", &db])
+        .assert()
+        .failure()
+        .code(1);
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    assert!(stderr.contains("99:99"), "stderr: {stderr}");
+}
+
+// ---- v0.0.2 §3: --under subtree scoping ----
+
+#[test]
+fn under_scopes_find_text_search_where_and_intersects_with_page() {
+    let (_dir, db) = fixture_db();
+    let run = |args: &[&str]| {
+        let out = Command::cargo_bin("figmog")
+            .unwrap()
+            .args(args)
+            .args(["--db", &db])
+            .assert()
+            .success();
+        serde_json::from_slice::<serde_json::Value>(&out.get_output().stdout).unwrap()
+    };
+
+    // find --under: COMPONENT nodes live on page 0:2, outside 1:1's subtree.
+    let none = run(&["find", "--type", "COMPONENT", "--under", "1:1"]);
+    assert_eq!(none.as_array().unwrap().len(), 0);
+
+    // --under is inclusive of the scope root itself.
+    let inclusive = run(&["find", "--type", "FRAME", "--under", "1:1"]);
+    assert_eq!(inclusive.as_array().unwrap().len(), 1);
+    assert_eq!(inclusive[0]["id"], "1:1");
+
+    // text --under narrows to one page's subtree.
+    let text_under = run(&["text", "--under", "1:1"]);
+    assert_eq!(text_under.as_array().unwrap().len(), 1);
+    assert_eq!(text_under[0]["id"], "1:2");
+    let text_elsewhere = run(&["text", "--under", "2:1"]); // Button component set: no TEXT nodes
+    assert_eq!(text_elsewhere.as_array().unwrap().len(), 0);
+
+    // search --under.
+    let search_under = run(&["search", "garden", "--under", "1:1"]);
+    assert_eq!(search_under[0]["id"], "1:2");
+    let search_outside = run(&["search", "garden", "--under", "0:2"]);
+    assert_eq!(search_outside.as_array().unwrap().len(), 0);
+
+    // where --under.
+    let where_under = run(&[
+        "where",
+        "--pointer",
+        "/layoutMode",
+        "--equals",
+        "VERTICAL",
+        "--under",
+        "1:1",
+    ]);
+    assert_eq!(where_under.as_array().unwrap().len(), 1);
+    let where_outside = run(&[
+        "where",
+        "--pointer",
+        "/layoutMode",
+        "--equals",
+        "VERTICAL",
+        "--under",
+        "0:2",
+    ]);
+    assert_eq!(where_outside.as_array().unwrap().len(), 0);
+
+    // --under intersects with --page: page 0:2's TEXT nodes scoped under
+    // page 0:1's subtree is the empty intersection.
+    let intersected = run(&["find", "--type", "TEXT", "--page", "0:2", "--under", "0:1"]);
+    assert_eq!(
+        intersected.as_array().unwrap().len(),
+        0,
+        "page and under compose by intersection"
+    );
+}
+
+#[test]
+fn under_unknown_id_errors_cleanly() {
+    let (_dir, db) = fixture_db();
+    let out = Command::cargo_bin("figmog")
+        .unwrap()
+        .args(["find", "--type", "TEXT", "--under", "99:99", "--db", &db])
+        .assert()
+        .failure()
+        .code(1);
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    assert!(stderr.contains("99:99"), "stderr: {stderr}");
+}
+
+/// Review fix I1: `search --under` must rank the *entire* matching corpus
+/// before truncating to `limit`, not truncate to the global top-`limit`
+/// and filter afterward — otherwise a tight limit under a scope that
+/// contains a real (if globally lower-ranked) match silently returns
+/// nothing. Fixture: five short out-of-scope TEXT nodes named exactly
+/// "garden" (BM25 favors them — an exact, single-term document scores
+/// higher than a longer one containing the term once) rank above the one
+/// in-scope node whose text merely *contains* "garden" among other words.
+#[test]
+fn search_under_ranks_the_full_corpus_before_truncating_to_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let response = dir.path().join("resp.json");
+    let fixture = serde_json::json!({
+        "name": "SearchUnderFixture",
+        "version": "1",
+        "lastModified": "2026-08-17T00:00:00Z",
+        "document": {
+            "id": "0:0", "name": "Document", "type": "DOCUMENT",
+            "children": [
+                { "id": "0:1", "name": "Page 1", "type": "CANVAS", "children": [
+                    { "id": "1:1", "name": "Scope", "type": "FRAME", "children": [
+                        { "id": "1:2", "name": "Info", "type": "TEXT",
+                          "characters": "A lovely garden path unfolds among tall trees",
+                          "children": [] }
+                    ] }
+                ] },
+                { "id": "0:2", "name": "Page 2", "type": "CANVAS", "children": [
+                    { "id": "2:1", "name": "garden", "type": "TEXT", "children": [] },
+                    { "id": "2:2", "name": "garden", "type": "TEXT", "children": [] },
+                    { "id": "2:3", "name": "garden", "type": "TEXT", "children": [] },
+                    { "id": "2:4", "name": "garden", "type": "TEXT", "children": [] },
+                    { "id": "2:5", "name": "garden", "type": "TEXT", "children": [] }
+                ] }
+            ]
+        },
+        "components": {}, "componentSets": {}, "styles": {}
+    });
+    std::fs::write(&response, serde_json::to_string(&fixture).unwrap()).unwrap();
+    let db = dir.path().join("db").display().to_string();
+    Command::cargo_bin("figmog")
+        .unwrap()
+        .args([
+            "pull",
+            "--from-file",
+            response.to_str().unwrap(),
+            "--db",
+            &db,
+        ])
+        .assert()
+        .success();
+
+    let run = |args: &[&str]| {
+        let out = Command::cargo_bin("figmog")
+            .unwrap()
+            .args(args)
+            .args(["--db", &db])
+            .assert()
+            .success();
+        serde_json::from_slice::<serde_json::Value>(&out.get_output().stdout).unwrap()
+    };
+
+    // Premise check: unscoped top-1 is an out-of-scope short match, not
+    // the in-scope one — otherwise this fixture doesn't reproduce I1.
+    let unscoped = run(&["search", "garden", "-n", "1"]);
+    assert_ne!(
+        unscoped[0]["id"], "1:2",
+        "premise: the in-scope match must rank below the out-of-scope ones globally"
+    );
+
+    // The reviewer's exact repro shape: a tight limit under a scope whose
+    // only match is globally outranked must still return it, not [].
+    let scoped = run(&["search", "garden", "-n", "1", "--under", "1:1"]);
+    let ids: Vec<&str> = scoped
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["1:2"],
+        "scoped search ranks the full corpus before truncating"
+    );
+
+    // A wider limit that still fits inside the scope: same single hit,
+    // nothing else under 1:1 matches "garden".
+    let scoped_wide = run(&["search", "garden", "-n", "5", "--under", "1:1"]);
+    assert_eq!(scoped_wide.as_array().unwrap().len(), 1);
+    assert_eq!(scoped_wide[0]["id"], "1:2");
+}
+
+// ---- v0.0.2 §6: --resolve-vars ----
+
+#[test]
+fn resolve_vars_marks_bindings_unresolved_with_no_variables_table() {
+    let (_dir, db) = fixture_db();
+
+    // No import: both of 1:1's bound variables (fill color, paddingLeft)
+    // have no entry in the (empty) variables table.
+    let out = Command::cargo_bin("figmog")
+        .unwrap()
+        .args(["get", "1:1", "--resolve-vars", "--db", &db])
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let resolved = v["resolved_variables"].as_array().unwrap();
+    assert_eq!(resolved.len(), 2);
+    for entry in resolved {
+        assert_eq!(entry["source"], "unresolved");
+        assert!(
+            entry["variable_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("VariableID:")
+        );
+        assert!(entry.get("variable_name").is_none());
+    }
+}
+
+#[test]
+fn resolve_vars_resolves_imported_variables_on_get_dump_and_styles_values() {
+    let (dir, db) = fixture_db();
+    let export = dir.path().join("vars.json");
+    std::fs::write(&export, include_str!("fixtures/variables-export.json")).unwrap();
+    Command::cargo_bin("figmog")
+        .unwrap()
+        .args(["import-variables", export.to_str().unwrap(), "--db", &db])
+        .assert()
+        .success();
+
+    // `get --resolve-vars`: names + per-mode values from the imported table.
+    let out = Command::cargo_bin("figmog")
+        .unwrap()
+        .args(["get", "1:1", "--resolve-vars", "--db", &db])
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let resolved = v["resolved_variables"].as_array().unwrap();
+    assert_eq!(resolved.len(), 2);
+    let color = resolved
+        .iter()
+        .find(|e| e["variable_id"] == "VariableID:100")
+        .expect("fill color binding present");
+    assert_eq!(color["variable_name"], "color/surface/primary");
+    assert_eq!(color["values_by_mode"]["light"]["r"], 0.06);
+    assert_eq!(color["values_by_mode"]["dark"]["type"], "VARIABLE_ALIAS");
+    let padding = resolved
+        .iter()
+        .find(|e| e["variable_id"] == "VariableID:200")
+        .expect("paddingLeft binding present");
+    assert_eq!(padding["variable_name"], "space/md");
+    assert_eq!(padding["values_by_mode"]["default"], 16.0);
+
+    // `dump --resolve-vars`: same annotation, applied recursively.
+    let out = Command::cargo_bin("figmog")
+        .unwrap()
+        .args(["dump", "1:1", "--resolve-vars", "--db", &db])
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(v["resolved_variables"].as_array().unwrap().len(), 2);
+
+    // `styles --values --resolve-vars`: FILL style S:1's definition comes
+    // from consumer 1:1, whose /fills/0/color binding is VariableID:100 —
+    // paddingLeft (outside /fills) must not leak into this style's list.
+    let out = Command::cargo_bin("figmog")
+        .unwrap()
+        .args(["styles", "--values", "--resolve-vars", "--db", &db])
+        .assert()
+        .success();
+    let styles: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let fill_style = styles
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["style_id"] == "S:1")
+        .expect("FILL style S:1 present");
+    let fill_resolved = fill_style["resolved_variables"].as_array().unwrap();
+    assert_eq!(fill_resolved.len(), 1);
+    assert_eq!(fill_resolved[0]["variable_id"], "VariableID:100");
+    assert_eq!(fill_resolved[0]["variable_name"], "color/surface/primary");
+}
+
+// ---- v0.0.2 §2b: URL-addressed nodes ----
+
+#[test]
+fn get_dump_and_path_accept_a_full_figma_url_as_the_node_id() {
+    let (_dir, db) = fixture_db();
+    let url = "https://www.figma.com/design/flAtUnMfzvA5daBSTFQK35/Fixture?node-id=1-1&t=abc-1";
+
+    let bare = Command::cargo_bin("figmog")
+        .unwrap()
+        .args(["get", "1:1", "--db", &db])
+        .assert()
+        .success();
+    let bare: serde_json::Value = serde_json::from_slice(&bare.get_output().stdout).unwrap();
+
+    let via_url = Command::cargo_bin("figmog")
+        .unwrap()
+        .args(["get", url, "--db", &db])
+        .assert()
+        .success();
+    let via_url: serde_json::Value = serde_json::from_slice(&via_url.get_output().stdout).unwrap();
+    assert_eq!(
+        bare, via_url,
+        "a frame URL resolves to the same node as its bare id"
+    );
+
+    let dump_via_url = Command::cargo_bin("figmog")
+        .unwrap()
+        .args(["dump", url, "--depth", "0", "--db", &db])
+        .assert()
+        .success();
+    let dump_via_url: serde_json::Value =
+        serde_json::from_slice(&dump_via_url.get_output().stdout).unwrap();
+    assert_eq!(dump_via_url["id"], "1:1");
+
+    let path_via_url = Command::cargo_bin("figmog")
+        .unwrap()
+        .args(["path", url, "--db", &db])
+        .assert()
+        .success();
+    let path_via_url: serde_json::Value =
+        serde_json::from_slice(&path_via_url.get_output().stdout).unwrap();
+    let ids: Vec<&str> = path_via_url
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["0:0", "0:1", "1:1"]);
+}
+
+/// Review fix I2: `--page` is a node-id argument too (a page id), and
+/// hadn't been routed through the same URL-aware normalization as
+/// `id`/`under`/`target` — a pasted Figma URL silently matched nothing.
+#[test]
+fn page_argument_accepts_a_full_figma_url() {
+    let (_dir, db) = fixture_db();
+    let run = |args: &[&str]| {
+        let out = Command::cargo_bin("figmog")
+            .unwrap()
+            .args(args)
+            .args(["--db", &db])
+            .assert()
+            .success();
+        serde_json::from_slice::<serde_json::Value>(&out.get_output().stdout).unwrap()
+    };
+
+    let bare = run(&["find", "--type", "TEXT", "--page", "0:1"]);
+    let url = "https://www.figma.com/design/flAtUnMfzvA5daBSTFQK35/Fixture?node-id=0-1&t=abc-1";
+    let via_url = run(&["find", "--type", "TEXT", "--page", url]);
+    assert_eq!(
+        bare, via_url,
+        "a page URL matches the same rows as its bare id"
+    );
+    assert_eq!(bare.as_array().unwrap().len(), 1);
+    assert_eq!(bare[0]["id"], "1:2");
+}
+
+// ---- figmog images (v0.0.2 spec §5) ----
+//
+// No automated live-network test anywhere in this crate's suite (spec §5;
+// see `images.rs`'s own module doc comment): `images::resolve`'s own unit
+// tests already exercise the full render/fill/eviction orchestration
+// against a scripted `FigmaApi` fake, so these e2e tests only need to
+// prove the CLI's offline-reachable surface — no serve running, no
+// FIGMA_TOKEN, socket routing never engaged.
+
+/// A mirror is established (`pull --from-file`, no network), but no
+/// FIGMA_TOKEN is set and no serve is running: every requested id is a
+/// cache miss, so `figmog images` must still print a manifest-shaped JSON
+/// array on stdout (never the generic `{"error": ...}` shape) with a
+/// per-item error naming FIGMA_TOKEN, and exit 1 (spec §5: partial/zero
+/// success is still manifest output, exit reflects success count alone).
+#[test]
+fn images_no_token_error_path_is_manifest_shaped_json_exit_1() {
+    let dir = tempfile::tempdir().unwrap();
+    let response = dir.path().join("resp.json");
+    std::fs::write(
+        &response,
+        serde_json::to_string(&common::fixture_v1()).unwrap(),
+    )
+    .unwrap();
+
+    Command::cargo_bin("figmog")
+        .unwrap()
+        .current_dir(dir.path())
+        .args([
+            "pull",
+            "flAtUnMfzvA5daBSTFQK35",
+            "--from-file",
+            response.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let out = Command::cargo_bin("figmog")
+        .unwrap()
+        .current_dir(dir.path())
+        .env_remove("FIGMA_TOKEN")
+        .args(["images", "1:2", "--no-socket"])
+        .assert()
+        .failure()
+        .code(1);
+
+    let stdout = out.get_output().stdout.clone();
+    let v: serde_json::Value = serde_json::from_slice(&stdout).unwrap_or_else(|e| {
+        panic!(
+            "stdout not JSON: {e}\nstdout: {}",
+            String::from_utf8_lossy(&stdout)
+        )
+    });
+    let rows = v.as_array().expect("manifest is a JSON array");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], "1:2");
+    assert_eq!(rows[0]["kind"], "render");
+    assert_eq!(rows[0]["cached"], false);
+    let error = rows[0]["error"].as_str().expect("error field present");
+    assert!(error.contains("FIGMA_TOKEN"), "error: {error}");
+    assert!(
+        rows[0].get("path").is_none(),
+        "nothing was written: {rows:?}"
+    );
+}
+
+/// A well-formed-looking file key with no established mirror at all: the
+/// CLI's own `resolve_db` fails before `cmd_images` is ever reached —
+/// still exit 1, but the generic `{"error": ...}` shape (no mirror to
+/// build a per-item manifest against), on stderr like every other command
+/// missing a mirror.
+#[test]
+fn images_with_no_established_mirror_fails_like_every_other_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = Command::cargo_bin("figmog")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["images", "1:2"])
+        .assert()
+        .failure()
+        .code(1);
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    assert!(stderr.contains("no mirror here"), "stderr: {stderr}");
+}
+
+/// `figmog images` with zero ids is a clap usage error, not a runtime one
+/// (matching the `figmog_images` tool's own explicit `` `ids` must not be
+/// empty `` rejection in `dispatch::require_str_array`) — never gets far
+/// enough to open a store or hit the network.
+#[test]
+fn images_with_no_ids_is_rejected_by_clap() {
+    let out = Command::cargo_bin("figmog")
+        .unwrap()
+        .args(["images"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    assert!(
+        stderr.to_lowercase().contains("required")
+            || stderr.to_lowercase().contains("the following required"),
+        "expected clap to reject a missing required `ids` argument: {stderr}"
     );
 }

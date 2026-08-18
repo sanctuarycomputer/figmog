@@ -8,9 +8,9 @@
 
 [package]
 name = "figmog"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
-license = "MIT"
+license = "AGPL-3.0-only"
 
 [dependencies]
 fold = { git = "https://github.com/flowercomputers/bogkit", rev = "20f2ca50d5d06f51edfe8b8570c0fb48caf9eb81" }

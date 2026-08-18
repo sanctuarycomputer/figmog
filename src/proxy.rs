@@ -337,7 +337,7 @@ mod tests {
         assert!(!poll);
         assert_eq!(upstream.call_count, 1);
 
-        let stored = st.rtx(|(_, _, _, _, _, _, _, cache)| {
+        let stored = st.rtx(|(_, _, _, _, _, _, _, cache, _, _)| {
             cache::lookup(
                 &cache,
                 "get_code",
@@ -449,7 +449,7 @@ mod tests {
         assert_eq!(value, error_result);
         assert!(!poll);
 
-        let stored = st.rtx(|(_, _, _, _, _, _, _, cache)| {
+        let stored = st.rtx(|(_, _, _, _, _, _, _, cache, _, _)| {
             cache::lookup(
                 &cache,
                 "get_code",

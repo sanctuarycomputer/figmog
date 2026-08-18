@@ -64,11 +64,25 @@ pub(crate) struct PullOutcome {
 // can't be named (this module's doc comment), so it can never appear in a
 // named struct field directly — only behind one of these closures.
 type DispatchFn = Box<dyn FnMut(&str, &Value) -> Result<ToolOutput, String>>;
-type PullFn = Box<dyn FnMut() -> Result<PullOutcome, PullError>>;
+/// `bool` argument: this pull's own geometry override (spec §4) —
+/// `figmog_open`'s `geometry` arg, or `false` from every other call site
+/// (startup, watch tick, `figmog_sync`, auto-open), which don't carry a
+/// user-facing override of their own and so just let the mirror's already-
+/// stored setting (if any) keep driving the request — see [`do_pull`].
+type PullFn = Box<dyn FnMut(bool) -> Result<PullOutcome, PullError>>;
 type WatermarkFn = Box<dyn FnMut() -> Option<String>>;
 type ProxyCacheFn = Box<
     dyn FnMut(&mut crate::upstream::HttpUpstream, &str, &Value) -> Result<(Value, bool), String>,
 >;
+/// `figmog_images` (v0.0.2 spec §5): `(ids, format, scale) ->` every
+/// requested render/fill, cache-first. A fifth closure beyond `dispatch`/
+/// `pull`/`watermark`/`proxy_cache`, for the same structural reason as
+/// `proxy_cache` — it needs this session's own store (for caching) *and*
+/// the network (for misses), so it can't be answered by `dispatch`
+/// (read-only) or folded into `pull` (a different fetch/cache shape
+/// entirely, and images is never automatic — see this type's own callers).
+type ImagesFn =
+    Box<dyn FnMut(&[String], &str, Option<f64>) -> Result<Vec<crate::images::ImageItem>, String>>;
 
 /// One mirrored Figma file. `dispatch` answers the 16 read-only
 /// `figmog_*` tools (everything [`dispatch::dispatch_read_tool`] knows);
@@ -98,6 +112,9 @@ type ProxyCacheFn = Box<
 /// from behind one of these closures. `serve.rs` calls it only for the
 /// *default* session — see its own doc comment for why proxied calls
 /// route through the default rather than any per-call `file` argument.
+///
+/// `images` (v0.0.2 spec §5) is a fifth — see [`ImagesFn`]'s own doc
+/// comment.
 pub(crate) struct FileSession {
     pub(crate) key: String,
     pub(crate) name: String,
@@ -105,6 +122,7 @@ pub(crate) struct FileSession {
     pub(crate) pull: PullFn,
     pub(crate) watermark: WatermarkFn,
     pub(crate) proxy_cache: ProxyCacheFn,
+    pub(crate) images: ImagesFn,
     pub(crate) watcher: Watcher,
     pub(crate) backoff: Duration,
     pub(crate) mirrored: bool,
@@ -140,8 +158,9 @@ impl FileSession {
 pub(crate) fn do_pull(
     session: &mut FileSession,
     interval: Duration,
+    geometry: bool,
 ) -> Result<PullOutcome, (String, Duration)> {
-    match (session.pull)() {
+    match (session.pull)(geometry) {
         Ok(outcome) => {
             session.note_pull_success(&outcome);
             Ok(outcome)
@@ -207,15 +226,25 @@ pub(crate) fn open_session_at(
         let st = st.clone();
         let network_key = network_key.clone();
         let token = token.clone();
-        move || -> Result<PullOutcome, PullError> {
+        move |geometry_override: bool| -> Result<PullOutcome, PullError> {
             let key = network_key.clone().ok_or_else(|| {
                 PullError::from("no file key: pass a file key or figma.com URL".to_string())
             })?;
             let token = token.clone().ok_or_else(|| {
                 PullError::from("FIGMA_TOKEN not set — required for network pulls".to_string())
             })?;
+            // Sticky vector geometry (spec §4): what this pull requests
+            // combines its own override (`figmog_open`'s `geometry` arg,
+            // or `false` from every other caller — see `PullFn`'s doc
+            // comment) with whatever's already stored, so a plain re-pull
+            // of a mirror that was ever opened with `--geometry`/
+            // `geometry: true` keeps asking for it.
+            let stored_geometry = st
+                .borrow()
+                .rtx(|(.., mirror_config, _)| store::read_geometry(&mirror_config));
+            let request_geometry = store::effective_geometry(geometry_override, stored_geometry);
             let api = UreqApi::new(token);
-            let resp = api.file(&key)?;
+            let resp = api.file(&key, request_geometry)?;
             // Opportunistic Enterprise variables sync (spec §12): `Ok(None)`
             // on non-Enterprise plans is not an error — v1 behavior
             // (import/inference, sweep-exempt) holds unchanged below.
@@ -230,25 +259,36 @@ pub(crate) fn open_session_at(
             if let Some(v) = &vars_resp {
                 let var_recs = crate::vars::parse_variables_export(v).map_err(|e| e.to_string())?;
                 flattened.recs.extend(var_recs);
-                let stored_var_ids =
-                    st.rtx(|(_, _, _, _, variables, variable_collections, _, _)| {
+                let stored_var_ids = st.rtx(
+                    |(_, _, _, _, variables, variable_collections, _, _, _, _)| {
                         collect_variable_ids(&variables, &variable_collections)
-                    });
+                    },
+                );
                 prior.extend(stored_var_ids);
             }
             let churn = store::sync(&mut st, &prior, &flattened, now_ms());
 
             // Cache eviction lives here rather than folded into `sync`
             // (store.rs's own note): a version-changing pull sweeps stale
-            // `proxy_cache` rows; computing `stale` against the version
-            // just synced makes this a no-op whenever the version didn't
+            // `proxy_cache` rows (and, v0.0.2 spec §5, stale `images` rows
+            // the same way); computing `stale` against the version just
+            // synced makes this a no-op whenever the version didn't
             // actually move, with no separate "did it change" check needed.
             let version = flattened.file.version.clone();
-            let stale =
-                st.rtx(|(_, _, _, _, _, _, _, cache)| store::stale_cache_ids(&cache, &version));
+            let mut stale = st.rtx(|(_, _, _, _, _, _, _, cache, _, images)| {
+                let mut stale = store::stale_cache_ids(&cache, &version);
+                stale.extend(store::stale_image_ids(&images, &version));
+                stale
+            });
             if !stale.is_empty() {
+                stale.sort();
                 store::evict_stale_cache(&mut st, &stale);
             }
+
+            // Persist the (possibly just-turned-on) geometry flag so the
+            // *next* pull's own peek above sees it, even if this call's
+            // override was the only reason it was requested this time.
+            store::upsert_mirror_config(&mut st, request_geometry);
 
             Ok(PullOutcome {
                 churn,
@@ -259,19 +299,19 @@ pub(crate) fn open_session_at(
     };
 
     if pull_now {
-        pull_closure().map_err(|e| e.to_string())?;
+        pull_closure(false).map_err(|e| e.to_string())?;
     }
 
     let meta_present = st
         .borrow()
-        .rtx(|(_, _, _, _, _, _, meta, _)| meta.get(&0).is_some());
+        .rtx(|(_, _, _, _, _, _, meta, _, _, _)| meta.get(&0).is_some());
     let name = st
         .borrow()
-        .rtx(|(_, _, _, _, _, _, meta, _)| meta.get(&0).map(|m| m.name.clone()))
+        .rtx(|(_, _, _, _, _, _, meta, _, _, _)| meta.get(&0).map(|m| m.name.clone()))
         .unwrap_or_else(|| key.clone());
     let seen = st
         .borrow()
-        .rtx(|(_, _, _, _, _, _, meta, _)| meta.get(&0).map(|m| m.last_modified.clone()));
+        .rtx(|(_, _, _, _, _, _, meta, _, _, _)| meta.get(&0).map(|m| m.last_modified.clone()));
 
     let dispatch: DispatchFn = {
         let st = st.clone();
@@ -296,8 +336,9 @@ pub(crate) fn open_session_at(
     let watermark: WatermarkFn = {
         let st = st.clone();
         Box::new(move || {
-            st.borrow()
-                .rtx(|(_, _, _, _, _, _, meta, _)| meta.get(&0).map(|m| m.last_modified.clone()))
+            st.borrow().rtx(|(_, _, _, _, _, _, meta, _, _, _)| {
+                meta.get(&0).map(|m| m.last_modified.clone())
+            })
         })
     };
 
@@ -306,7 +347,7 @@ pub(crate) fn open_session_at(
         Box::new(move |upstream, name, args| {
             let args_canonical = crate::proxy::canonical_args(args)?;
             let version_and_hit = if crate::proxy::is_cacheable(name, args) {
-                st.borrow().rtx(|(_, _, _, _, _, _, meta, cache)| {
+                st.borrow().rtx(|(_, _, _, _, _, _, meta, cache, _, _)| {
                     let version = meta.get(&0).map(|m| m.version.clone());
                     let hit = version
                         .as_ref()
@@ -321,6 +362,42 @@ pub(crate) fn open_session_at(
         })
     };
 
+    // `figmog_images` (v0.0.2 spec §5): the two-step `scan` (read-only,
+    // this session's own concrete `open_store!` handle — see
+    // `images.rs`'s own doc comment for why that split exists at all) then
+    // `resolve` (network + cache-write) dance, with the session's api
+    // token and network key exactly like `pull_closure` above. `api: None`
+    // when no token was configured at all — `resolve` itself still serves
+    // every cache hit for free in that case (see its own doc comment).
+    let images: ImagesFn = {
+        let st = st.clone();
+        let network_key = network_key.clone();
+        let token = token.clone();
+        Box::new(move |ids: &[String], format: &str, scale: Option<f64>| {
+            let key = network_key
+                .clone()
+                .ok_or_else(|| "no file key: pass a file key or figma.com URL".to_string())?;
+            let node_ids = crate::images::normalize_ids(ids);
+            let scale_m = crate::images::scale_milli(scale);
+            let mut st = st.borrow_mut();
+            let scanned = st.rtx(|((nodes, ..), _, _, _, _, _, meta, _, _, images)| {
+                crate::images::scan(&nodes, &meta, &images, &node_ids, format, scale_m)
+            });
+            let api = token.clone().map(UreqApi::new);
+            let download = crate::api::download_bytes;
+            Ok(crate::images::resolve(
+                &mut st,
+                scanned,
+                api.as_ref().map(|a| a as &dyn crate::api::FigmaApi),
+                &download,
+                &key,
+                &node_ids,
+                format,
+                scale,
+            ))
+        })
+    };
+
     Ok(FileSession {
         key,
         name,
@@ -328,6 +405,7 @@ pub(crate) fn open_session_at(
         pull,
         watermark,
         proxy_cache,
+        images,
         watcher: Watcher::new(seen),
         backoff: BACKOFF_START,
         mirrored: meta_present,
@@ -424,7 +502,11 @@ impl SessionManager {
                 if session.mirrored {
                     Ok((session, None))
                 } else {
-                    match do_pull(session, interval) {
+                    // No user-facing geometry override reaches an implicit
+                    // auto-open (only `figmog_open` carries one) — this
+                    // just lets the mirror's stored setting, if any, drive
+                    // the request (spec §4).
+                    match do_pull(session, interval, false) {
                         Ok(outcome) => Ok((session, Some(outcome))),
                         Err((message, wait)) => Err(ResolveError {
                             message,
@@ -515,7 +597,7 @@ mod tests {
         let watermark: WatermarkFn = Box::new(|| Some("t".to_string()));
         let pull: PullFn = {
             let pull_calls = pull_calls.clone();
-            Box::new(move || {
+            Box::new(move |_geometry: bool| {
                 let call_index = *pull_calls.borrow();
                 *pull_calls.borrow_mut() += 1;
                 script(call_index)
@@ -531,6 +613,9 @@ mod tests {
                 Err(format!(
                     "scripted session has no store to proxy through: {name}"
                 ))
+            }),
+            images: Box::new(|_ids, _format, _scale| {
+                Err("scripted session has no store for images".to_string())
             }),
             watcher: Watcher::new(None),
             backoff: BACKOFF_START,
@@ -782,7 +867,7 @@ mod tests {
             });
         session.backoff = backoff;
 
-        let (message, wait) = do_pull(&mut session, Duration::from_secs(10)).unwrap_err();
+        let (message, wait) = do_pull(&mut session, Duration::from_secs(10), false).unwrap_err();
         assert!(message.contains("retry after"), "{message}");
         // `pull_failure_wait` honors Retry-After for a rate limit
         // regardless of the configured interval, and does NOT touch the
@@ -791,5 +876,55 @@ mod tests {
         assert_eq!(wait, Duration::from_secs(90));
         assert_eq!(session.backoff, BACKOFF_START);
         let _ = &mut backoff;
+    }
+
+    // ---- sticky vector geometry (v0.0.2 spec §4) ----
+
+    /// [`do_pull`]'s `geometry` argument must reach the session's own
+    /// `pull` closure unchanged — the plumbing every re-pull call site
+    /// (`figmog_open`'s explicit arg, or `false` from every other caller:
+    /// startup, watch tick, `figmog_sync`, auto-open) relies on. The
+    /// closure's own decision to union this with the stored flag
+    /// (`store::effective_geometry`) is proven separately and purely at
+    /// the store/api layer — this test only proves the *argument*
+    /// threading, at the one layer (`FileSession`/`SessionManager`) that
+    /// can't be exercised without a real store or network.
+    #[test]
+    fn do_pull_forwards_its_geometry_argument_to_the_session_pull_closure() {
+        let seen: Rc<RefCell<Vec<bool>>> = Rc::new(RefCell::new(Vec::new()));
+        let pull: PullFn = {
+            let seen = seen.clone();
+            Box::new(move |geometry: bool| {
+                seen.borrow_mut().push(geometry);
+                Ok(PullOutcome {
+                    churn: Churn::default(),
+                    name: "Scripted".to_string(),
+                    version: "1".to_string(),
+                })
+            })
+        };
+        let mut session = FileSession {
+            key: "keyA1234567890".to_string(),
+            name: "Scripted".to_string(),
+            dispatch: Box::new(|_name, _args| Ok(ToolOutput::Json(json!({})))),
+            pull,
+            watermark: Box::new(|| Some("t".to_string())),
+            proxy_cache: Box::new(|_upstream, name, _args| {
+                Err(format!(
+                    "scripted session has no store to proxy through: {name}"
+                ))
+            }),
+            images: Box::new(|_ids, _format, _scale| {
+                Err("scripted session has no store for images".to_string())
+            }),
+            watcher: Watcher::new(None),
+            backoff: BACKOFF_START,
+            mirrored: false,
+        };
+
+        do_pull(&mut session, Duration::from_secs(10), true).unwrap();
+        do_pull(&mut session, Duration::from_secs(10), false).unwrap();
+
+        assert_eq!(*seen.borrow(), vec![true, false]);
     }
 }

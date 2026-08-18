@@ -15,11 +15,18 @@ removed) verbatim, for provenance only — don't treat them as current.
 - **On-disk schema is frozen.** Pipeline sink names (`nodes`, `children`,
   `text`, `instances_of`, `styled_by`, `bound_to`, `by_type`,
   `components`, `component_sets`, `styles`, `variables`,
-  `variable_collections`, `meta`, `proxy_cache`) are on-disk schema —
-  renaming one changes what store directory an unmodified binary can
-  open. `Id`/`Rec` are append-only enums: postcard encodes variant
-  indices positionally, so a new variant goes at the end of each enum,
-  never inserted or reordered.
+  `variable_collections`, `meta`, `proxy_cache`, `mirror_config`,
+  `images`) are on-disk schema — renaming one changes what store
+  directory an unmodified binary can open. `Id`/`Rec` are append-only
+  enums: postcard encodes variant indices positionally, so a new variant
+  goes at the end of each enum, never inserted or reordered.
+- **New record kind, not a wider struct.** Postcard encodes struct fields
+  positionally too, so adding a field to an existing `Rec` payload struct
+  (`FileMeta`, `NodeRec`, …) breaks decoding of every store already on
+  disk, while appending an `Id`/`Rec` variant does not. When a feature
+  needs new stored state, add a new record kind (and its own appended
+  sink) rather than widening an existing one — `MirrorConfig` is the
+  worked example.
 - **`fold`/`bogkit` is upstream.** Never vendored, never patched — consume
   only the pinned git dependency's public API.
 - **Gates for any change:** `cargo test`, `cargo clippy --no-deps
@@ -28,6 +35,12 @@ removed) verbatim, for provenance only — don't treat them as current.
 - **No new dependencies without a written justification in the PR.**
 - **Fixtures are synthetic only** — nothing derived from real client
   files.
+- **License: AGPL-3.0-only, no per-file headers (yet).** figmog's own
+  code is AGPL-3.0-only as of v0.0.2; the v0.0.1 snapshot stays MIT.
+  Per-file license headers were deliberately skipped. Revisit both that
+  decision and a contributor license agreement if the project starts
+  taking outside contributions, since relicensing or dual-licensing later
+  needs the rights a CLA collects.
 - **Pin-bump checklist.** Bumping `fold`'s pinned `rev` in `Cargo.toml`
   isn't just a version bump: `cli/mod.rs`'s `open_store_checked` matches
   the substring `"Locked"` against a caught panic's payload to distinguish

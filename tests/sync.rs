@@ -69,6 +69,8 @@ fn initial_pull_populates_every_sink() {
             _colls,
             meta,
             _cache,
+            _mirror_config,
+            _images,
         )| {
             assert_eq!(nodes.iter().count(), 12);
             assert_eq!(nodes.get(&"1:2".to_string()).unwrap().name, "Title");
@@ -145,7 +147,7 @@ fn reopen_resumes_persisted_state() {
         sync(&mut st, &BTreeSet::new(), &flattened, 1_000);
     }
     let st = figmog::open_store!(&db);
-    st.rtx(|((nodes, ..), _, _, _, _, _, _, _)| {
+    st.rtx(|((nodes, ..), _, _, _, _, _, _, _, _, _)| {
         assert_eq!(nodes.iter().count(), 12);
     });
 }
@@ -169,7 +171,7 @@ fn v1_to_v2_minimal_churn_and_index_consistency() {
     pull(&mut st, &common::fixture_v1());
 
     let prior = st.rtx(
-        |((nodes, ..), components, component_sets, styles, _, _, _, _)| {
+        |((nodes, ..), components, component_sets, styles, _, _, _, _, _, _)| {
             figmog::store::collect_sweepable(&nodes, &components, &component_sets, &styles)
         },
     );
@@ -201,6 +203,8 @@ fn v1_to_v2_minimal_churn_and_index_consistency() {
             _vc,
             meta,
             _cache,
+            _mirror_config,
+            _images,
         )| {
             // rename re-indexed in bm25
             assert!(text.search("Headline", 5).iter().any(|h| h.val == "1:2"));
@@ -262,12 +266,12 @@ fn sweep_never_touches_variables() {
         );
     });
     let prior = st.rtx(
-        |((nodes, ..), components, component_sets, styles, _, _, _, _)| {
+        |((nodes, ..), components, component_sets, styles, _, _, _, _, _, _)| {
             figmog::store::collect_sweepable(&nodes, &components, &component_sets, &styles)
         },
     );
     pull_with_sweep(&mut st, &common::fixture_v2(), prior, 2_000);
-    st.rtx(|(_, _, _, _, vars, colls, _, _)| {
+    st.rtx(|(_, _, _, _, vars, colls, _, _, _, _)| {
         assert!(vars.get(&"VariableID:100".to_string()).is_some());
         assert!(colls.get(&"VC:1".to_string()).is_some());
     });
@@ -305,7 +309,7 @@ fn panicking_transaction_rolls_back_entirely() {
         })
     }));
     assert!(result.is_err());
-    st.rtx(|((nodes, ..), _, _, _, _, _, meta, _)| {
+    st.rtx(|((nodes, ..), _, _, _, _, _, meta, _, _, _)| {
         assert!(
             nodes.get(&"9:9".to_string()).is_none(),
             "aborted upsert must not persist"
@@ -349,7 +353,7 @@ fn proxy_cache_survives_same_version_and_is_evicted_on_version_change() {
     figmog::cache::store(&mut st, tool, args, "100", &content).unwrap();
 
     // Cache row present right after the write.
-    st.rtx(|(_, _, _, _, _, _, _, cache)| {
+    st.rtx(|(_, _, _, _, _, _, _, cache, _, _)| {
         assert_eq!(
             figmog::cache::lookup(&cache, tool, args, "100"),
             Some(content.clone())
@@ -359,7 +363,7 @@ fn proxy_cache_survives_same_version_and_is_evicted_on_version_change() {
     // Identical re-pull: file version unchanged -> cache row must survive,
     // and so must the imported variable.
     pull(&mut st, &common::fixture_v1());
-    st.rtx(|(_, _, _, _, vars, _, _, cache)| {
+    st.rtx(|(_, _, _, _, vars, _, _, cache, _, _)| {
         assert_eq!(
             figmog::cache::lookup(&cache, tool, args, "100"),
             Some(content.clone()),
@@ -370,7 +374,7 @@ fn proxy_cache_survives_same_version_and_is_evicted_on_version_change() {
 
     // v1 -> v2 pull (version "100" -> "101") with the sweep enabled.
     let prior = st.rtx(
-        |((nodes, ..), components, component_sets, styles, _, _, _, _)| {
+        |((nodes, ..), components, component_sets, styles, _, _, _, _, _, _)| {
             figmog::store::collect_sweepable(&nodes, &components, &component_sets, &styles)
         },
     );
@@ -378,14 +382,14 @@ fn proxy_cache_survives_same_version_and_is_evicted_on_version_change() {
 
     // The cache row is now stale (its file_version is still "100").
     let stale =
-        st.rtx(|(_, _, _, _, _, _, _, cache)| figmog::store::stale_cache_ids(&cache, "101"));
+        st.rtx(|(_, _, _, _, _, _, _, cache, _, _)| figmog::store::stale_cache_ids(&cache, "101"));
     assert_eq!(
         stale,
         vec![Id::ProxyCache(figmog::cache::cache_key(tool, args))]
     );
     figmog::store::evict_stale_cache(&mut st, &stale);
 
-    st.rtx(|(_, _, _, _, vars, _, _, cache)| {
+    st.rtx(|(_, _, _, _, vars, _, _, cache, _, _)| {
         assert!(
             figmog::cache::lookup(&cache, tool, args, "101").is_none(),
             "stale cache row must be gone after eviction"
@@ -397,6 +401,71 @@ fn proxy_cache_survives_same_version_and_is_evicted_on_version_change() {
         assert!(
             vars.get(&"VariableID:100".to_string()).is_some(),
             "cache eviction must never touch sweep-exempt variables"
+        );
+    });
+}
+
+/// `images` rows (v0.0.2 spec §5) join the exact same version-triggered
+/// eviction path as `proxy_cache` (`stale_image_ids` / `evict_stale_cache`
+/// — see the test right above this one for the `proxy_cache` half): a
+/// row survives a same-version repull and is evicted, record-level, once
+/// the file version moves on.
+#[test]
+fn image_blob_survives_same_version_and_is_evicted_on_version_change() {
+    use figmog::images::image_key;
+    use figmog::model::ImageBlobRec;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut st = figmog::open_store!(dir.path().join("db"));
+    pull(&mut st, &common::fixture_v1());
+
+    let key = image_key("render", "1:2", "png", 1000);
+    let rec = ImageBlobRec {
+        key_hash: key.clone(),
+        kind: "render".into(),
+        subject: "1:2".into(),
+        format: "png".into(),
+        scale_milli: 1000,
+        file_version: "100".into(),
+        bytes: vec![1, 2, 3, 4],
+    };
+    st.wtx(|tx| {
+        tx.upsert(&Id::ImageBlob(key.clone()), &Rec::ImageBlob(rec.clone()));
+    });
+
+    // Row present right after the write.
+    st.rtx(|(_, _, _, _, _, _, _, _, _, images)| {
+        assert_eq!(images.get(&key), Some(rec.clone()));
+    });
+
+    // Identical re-pull: file version unchanged -> row must survive.
+    pull(&mut st, &common::fixture_v1());
+    st.rtx(|(_, _, _, _, _, _, _, _, _, images)| {
+        assert_eq!(
+            images.get(&key),
+            Some(rec.clone()),
+            "image row must survive a same-version repull"
+        );
+    });
+
+    // v1 -> v2 pull (version "100" -> "101") with the sweep enabled.
+    let prior = st.rtx(
+        |((nodes, ..), components, component_sets, styles, _, _, _, _, _, _)| {
+            figmog::store::collect_sweepable(&nodes, &components, &component_sets, &styles)
+        },
+    );
+    pull_with_sweep(&mut st, &common::fixture_v2(), prior, 2_000);
+
+    // The row is now stale (its file_version is still "100").
+    let stale = st
+        .rtx(|(_, _, _, _, _, _, _, _, _, images)| figmog::store::stale_image_ids(&images, "101"));
+    assert_eq!(stale, vec![Id::ImageBlob(key.clone())]);
+    figmog::store::evict_stale_cache(&mut st, &stale);
+
+    st.rtx(|(_, _, _, _, _, _, _, _, _, images)| {
+        assert!(
+            images.get(&key).is_none(),
+            "stale image row must be gone after eviction"
         );
     });
 }

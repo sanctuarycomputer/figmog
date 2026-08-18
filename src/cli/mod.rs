@@ -7,7 +7,7 @@
 //! keeps the clap types, top-level dispatch, `run`, and the store-opening/
 //! JSON-writing helpers every submodule shares.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
@@ -15,8 +15,10 @@ use serde_json::{Value, json};
 use crate::ident::parse_file_ref;
 
 mod call;
+mod images;
 mod pull;
 mod read;
+mod socket;
 
 pub(crate) use pull::{PullError, now_ms, pull_failure_wait, write_current};
 
@@ -26,6 +28,12 @@ struct Cli {
     /// Store directory (default: .figmog/<file-key>/db).
     #[arg(long, global = true)]
     db: Option<PathBuf>,
+    /// Don't try the running serve's unix-socket control plane (spec §1):
+    /// every read command, `tools`, and `call` always open the store
+    /// directly, exactly like pre-v0.0.2 figmog. On `figmog serve`, don't
+    /// listen on the socket at all.
+    #[arg(long, global = true)]
+    no_socket: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -42,6 +50,11 @@ enum Cmd {
         /// Wipe the store and rebuild from scratch.
         #[arg(long)]
         fresh: bool,
+        /// Request vector path data (fillGeometry/strokeGeometry) on this
+        /// pull. Sticky (spec §4): once set, every later pull of this
+        /// mirror keeps requesting it until `--fresh`.
+        #[arg(long)]
+        geometry: bool,
     },
     /// MCP stdio server: `figmog_*` tools over the local mirror, with the
     /// sync loop built in (one process owns the store), plus (unless
@@ -111,19 +124,43 @@ enum Cmd {
         id: String,
         #[arg(long)]
         children: bool,
+        /// Annotate `boundVariables` binding sites with variable names and
+        /// per-mode values under a `resolved_variables` key.
+        #[arg(long)]
+        resolve_vars: bool,
     },
-    /// Nodes by type, optionally within one page.
+    /// Full raw JSON subtree dump rooted at a node (default depth: unlimited).
+    Dump {
+        id: String,
+        #[arg(long)]
+        depth: Option<usize>,
+        /// Project every node to these raw fields (id/name/type/children
+        /// always survive). Comma-separated, e.g. --fields id,name,fills.
+        #[arg(long, value_delimiter = ',')]
+        fields: Option<Vec<String>>,
+        /// Annotate `boundVariables` binding sites with variable names and
+        /// per-mode values under a `resolved_variables` key.
+        #[arg(long)]
+        resolve_vars: bool,
+    },
+    /// Nodes by type, optionally within one page and/or a subtree scope.
     Find {
         #[arg(long = "type")]
         node_type: String,
         #[arg(long)]
         page: Option<String>,
+        /// Scope to the subtree rooted at this node id (inclusive).
+        #[arg(long)]
+        under: Option<String>,
     },
     /// BM25 search over layer names and text content.
     Search {
         query: String,
         #[arg(short = 'n', long, default_value = "10")]
         limit: usize,
+        /// Scope to the subtree rooted at this node id (inclusive).
+        #[arg(long)]
+        under: Option<String>,
     },
     /// Instances of a component (by node id, key, or name).
     Instances { target: String },
@@ -135,6 +172,10 @@ enum Cmd {
         style_type: Option<String>,
         #[arg(long)]
         values: bool,
+        /// With --values, annotate the definition's variable bindings under
+        /// a `resolved_variables` key.
+        #[arg(long)]
+        resolve_vars: bool,
     },
     /// Nodes using a style id or bound to a variable id.
     Uses { id: String },
@@ -150,6 +191,9 @@ enum Cmd {
     Text {
         #[arg(long)]
         page: Option<String>,
+        /// Scope to the subtree rooted at this node id (inclusive).
+        #[arg(long)]
+        under: Option<String>,
     },
     /// Nodes whose raw JSON matches an RFC 6901 pointer, optionally by value.
     Where {
@@ -161,6 +205,9 @@ enum Cmd {
         equals: Option<String>,
         #[arg(long)]
         page: Option<String>,
+        /// Scope to the subtree rooted at this node id (inclusive).
+        #[arg(long)]
+        under: Option<String>,
     },
     /// Nodes whose absolute bounds contain a point, sorted by area ascending.
     At {
@@ -168,6 +215,23 @@ enum Cmd {
         x: f64,
         #[arg(long)]
         y: f64,
+    },
+    /// Download node renders and/or fill images to --out, caching by file
+    /// version (spec §5). Never automatic — the images endpoints are
+    /// Figma's most rate-limited.
+    Images {
+        /// Node ids (or Figma URLs carrying node-id=) to render, and/or
+        /// scan for fill imageRefs. At least one required.
+        #[arg(required = true)]
+        ids: Vec<String>,
+        #[arg(long, default_value = "png")]
+        format: String,
+        /// Render scale (default 1).
+        #[arg(long)]
+        scale: Option<f64>,
+        /// Output directory (default ./figmog-images/).
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
 }
 
@@ -241,6 +305,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             upstream.clone(),
             *no_upstream,
             figmog_root.clone(),
+            cli.no_socket,
         );
     }
 
@@ -249,22 +314,90 @@ fn dispatch(cli: Cli) -> Result<(), String> {
     // `resolve_db`, exactly like `serve` above: it works with no
     // established `.figmog/current` and no `--db` at all, unlike `figmog
     // call` (below), which does need a resolved mirror to open.
+    //
+    // Socket routing (spec §1) applies here too, before any direct probe:
+    // reachable ⇒ the *running serve's* own merged registry (its own
+    // upstream connection, not this invocation's `--upstream`/
+    // `--no-upstream` — see `socket::try_tools_list`'s doc comment)
+    // answers instead.
     if let Cmd::Tools {
         upstream,
         no_upstream,
     } = &cli.cmd
     {
+        if !cli.no_socket
+            && cli.db.is_none()
+            && let Some(result) = socket::try_tools_list(Path::new(socket::DEFAULT_ROOT))
+        {
+            let tools = result?;
+            note_ignored_upstream_flags(upstream, *no_upstream);
+            return write_json(&socket::tools_rows(&tools));
+        }
         return call::cmd_tools(upstream.clone(), *no_upstream);
     }
 
+    // Socket routing (spec §1): every read command plus `call` first tries
+    // the running serve's unix-socket control plane for the resolved
+    // figmog-root — reachable ⇒ the command becomes a client of serve
+    // (always-fresh, no lock, and `call figmog_sync` reaches the *owning*
+    // process); unreachable ⇒ falls through to the direct-open path below,
+    // unchanged. Only meaningful when the root is knowable at all: `--db`
+    // bypasses the whole multi-file root concept (an arbitrary store path
+    // has no `<root>/serve.sock` to speak of), so this is skipped whenever
+    // `cli.db` was given, exactly like `--no-socket`.
+    if !cli.no_socket && cli.db.is_none() {
+        let root = Path::new(socket::DEFAULT_ROOT);
+        if let Cmd::Call {
+            tool,
+            args,
+            upstream,
+            no_upstream,
+        } = &cli.cmd
+        {
+            let parsed_args: Value = match args {
+                Some(raw) => {
+                    serde_json::from_str(raw).map_err(|e| format!("--args: invalid JSON: {e}"))?
+                }
+                None => json!({}),
+            };
+            // C1: route to the current mirror, exactly like direct mode's
+            // own `resolve_db` would — except `figmog_open`, whose `file`
+            // argument means "the file to open", not a routing hint (see
+            // `with_current_file`'s doc comment).
+            let parsed_args = if tool == "figmog_open" {
+                parsed_args
+            } else {
+                with_current_file(parsed_args)
+            };
+            if let Some(result) = socket::try_call(root, tool, parsed_args) {
+                note_ignored_upstream_flags(upstream, *no_upstream);
+                return write_json(&result?);
+            }
+        } else if let Some((tool, tool_args)) = cmd_as_tool_call(&cli.cmd) {
+            let tool_args = with_current_file(strip_nulls(tool_args));
+            if let Some(result) = socket::try_call(root, tool, tool_args) {
+                return write_json(&strip_routed_upstream_field(result?));
+            }
+        }
+    }
+
+    let db_given = cli.db.is_some();
     let db = resolve_db(&cli)?;
+    let no_socket = cli.no_socket;
     match cli.cmd {
         Cmd::Pull {
             file,
             from_file,
             fresh,
-        } => pull::cmd_pull(&db, file, from_file, fresh),
+            geometry,
+        } => pull::cmd_pull(&db, file, from_file, fresh, geometry),
         Cmd::ImportVariables { path } => call::cmd_import_variables(&db, path),
+        Cmd::Images {
+            ids,
+            format,
+            scale,
+            out,
+        } => images::cmd_images(&db, no_socket, db_given, ids, format, scale, out),
         Cmd::Call {
             tool,
             args,
@@ -280,9 +413,11 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             // destructure an unconstrained associated type.
             let st = open_store_checked(|| crate::open_store!(&db.path))?;
             match other {
-                Cmd::Status => st.rtx(|((nodes, _, _, _, _, _, _), _, _, _, _, _, meta, _)| {
-                    read::cmd_status(&nodes, &meta)
-                }),
+                Cmd::Status => st.rtx(
+                    |((nodes, _, _, _, _, _, _), _, _, _, _, _, meta, _, _, _)| {
+                        read::cmd_status(&nodes, &meta)
+                    },
+                ),
                 Cmd::Pages => st
                     .rtx(|((nodes, _, _, _, _, _, by_type), ..)| read::cmd_pages(&nodes, &by_type)),
                 Cmd::Tree { id, depth } => {
@@ -293,14 +428,52 @@ fn dispatch(cli: Cli) -> Result<(), String> {
                 Cmd::Get {
                     id,
                     children: with_children,
-                } => st.rtx(|((nodes, children, ..), ..)| {
-                    read::cmd_get(&nodes, &children, id, with_children)
+                    resolve_vars,
+                } => st.rtx(
+                    |((nodes, children, ..), _, _, _, variables, variable_collections, ..)| {
+                        read::cmd_get(
+                            &nodes,
+                            &children,
+                            &variables,
+                            &variable_collections,
+                            id,
+                            with_children,
+                            resolve_vars,
+                        )
+                    },
+                ),
+                Cmd::Dump {
+                    id,
+                    depth,
+                    fields,
+                    resolve_vars,
+                } => st.rtx(
+                    |((nodes, children, ..), _, _, _, variables, variable_collections, ..)| {
+                        read::cmd_dump(
+                            &nodes,
+                            &children,
+                            &variables,
+                            &variable_collections,
+                            id,
+                            depth,
+                            fields,
+                            resolve_vars,
+                        )
+                    },
+                ),
+                Cmd::Find {
+                    node_type,
+                    page,
+                    under,
+                } => st.rtx(|((nodes, children, _, _, _, _, by_type), ..)| {
+                    read::cmd_find(&nodes, &children, &by_type, node_type, page, under)
                 }),
-                Cmd::Find { node_type, page } => st.rtx(|((nodes, _, _, _, _, _, by_type), ..)| {
-                    read::cmd_find(&nodes, &by_type, node_type, page)
-                }),
-                Cmd::Search { query, limit } => st.rtx(|((nodes, _, text, ..), ..)| {
-                    read::cmd_search(&nodes, &text, query, limit)
+                Cmd::Search {
+                    query,
+                    limit,
+                    under,
+                } => st.rtx(|((nodes, children, text, ..), ..)| {
+                    read::cmd_search(&nodes, &children, &text, query, limit, under)
                 }),
                 Cmd::Instances { target } => st.rtx(
                     |((nodes, _, _, instances_of, ..), components, component_sets, ..)| {
@@ -316,16 +489,37 @@ fn dispatch(cli: Cli) -> Result<(), String> {
                 Cmd::Components => st.rtx(|((nodes, ..), components, component_sets, ..)| {
                     read::cmd_components(&component_sets, &components, &nodes)
                 }),
-                Cmd::Styles { style_type, values } => {
-                    st.rtx(|((nodes, _, _, _, styled_by, ..), _, _, styles, ..)| {
-                        read::cmd_styles(&styles, &styled_by, &nodes, style_type, values)
-                    })
-                }
+                Cmd::Styles {
+                    style_type,
+                    values,
+                    resolve_vars,
+                } => st.rtx(
+                    |(
+                        (nodes, _, _, _, styled_by, ..),
+                        _,
+                        _,
+                        styles,
+                        variables,
+                        variable_collections,
+                        ..,
+                    )| {
+                        read::cmd_styles(
+                            &styles,
+                            &styled_by,
+                            &nodes,
+                            &variables,
+                            &variable_collections,
+                            style_type,
+                            values,
+                            resolve_vars,
+                        )
+                    },
+                ),
                 Cmd::Uses { id } => st.rtx(|((nodes, _, _, _, styled_by, bound_to, _), ..)| {
                     read::cmd_uses(&nodes, &styled_by, &bound_to, id)
                 }),
                 Cmd::Vars { id } => st.rtx(
-                    |((nodes, ..), _, _, _, variables, variable_collections, _, _)| {
+                    |((nodes, ..), _, _, _, variables, variable_collections, _, _, _, _)| {
                         read::cmd_vars(&nodes, &variables, &variable_collections, id)
                     },
                 ),
@@ -349,24 +543,213 @@ fn dispatch(cli: Cli) -> Result<(), String> {
                     },
                 ),
                 Cmd::Path { id } => st.rtx(|((nodes, ..), ..)| read::cmd_path(&nodes, id)),
-                Cmd::Text { page } => st.rtx(|((nodes, _, _, _, _, _, by_type), ..)| {
-                    read::cmd_text(&nodes, &by_type, page)
-                }),
+                Cmd::Text { page, under } => {
+                    st.rtx(|((nodes, children, _, _, _, _, by_type), ..)| {
+                        read::cmd_text(&nodes, &children, &by_type, page, under)
+                    })
+                }
                 Cmd::Where {
                     pointer,
                     equals,
                     page,
-                } => st.rtx(|((nodes, ..), ..)| read::cmd_where(&nodes, pointer, equals, page)),
+                    under,
+                } => st.rtx(|((nodes, children, ..), ..)| {
+                    read::cmd_where(&nodes, &children, pointer, equals, page, under)
+                }),
                 Cmd::At { x, y } => st.rtx(|((nodes, ..), ..)| read::cmd_at(&nodes, x, y)),
                 Cmd::Pull { .. }
                 | Cmd::ImportVariables { .. }
                 | Cmd::Serve { .. }
                 | Cmd::Tools { .. }
-                | Cmd::Call { .. } => {
+                | Cmd::Call { .. }
+                | Cmd::Images { .. } => {
                     unreachable!("handled above")
                 }
             }
         }
+    }
+}
+
+/// Review m5: when a `tools`/`call` invocation explicitly named an
+/// `--upstream`/`--no-upstream` but got routed to the running serve's own
+/// socket, that flag was silently ignored (serve's own upstream connection,
+/// established at its own startup, is what actually answers — see
+/// `socket::try_tools_list`'s doc comment). Rather than leave that silent,
+/// print one stderr note. Detecting "explicitly passed" without clap's
+/// `ArgMatches` introspection is approximate: `no_upstream` is unambiguous
+/// (there's no way to "explicitly pass false" for a plain flag), but
+/// `upstream` can only be compared against its own default value — a user
+/// who explicitly retyped that exact default URL goes unnoted. An
+/// acceptable, documented gap for an informational note, not a behavior
+/// difference.
+fn note_ignored_upstream_flags(upstream: &str, no_upstream: bool) {
+    if no_upstream || upstream != crate::serve::DEFAULT_UPSTREAM_URL {
+        eprintln!(
+            "figmog: --upstream/--no-upstream ignored — routed to the running serve, whose own upstream settings apply"
+        );
+    }
+}
+
+/// Inject `.figmog/current`'s key as the routed `file` argument, when one
+/// is established and the call doesn't already carry an explicit `file`
+/// (review C1): without this, a socket-routed call carries no `file` at
+/// all, so serve answers from *its own* default session
+/// (`SessionManager::effective_default_key`) — which can silently diverge
+/// from the mirror `.figmog/current` (and thus direct mode) actually
+/// targets, or, in the zero-startup-file quick-start shape, doesn't exist
+/// at all (serve has no sessions yet), producing a hard "no default
+/// mirrored file" error even though a mirror is clearly established on
+/// disk. Injecting the current key routes the call through
+/// `SessionManager::resolve`'s explicit-`file` path instead, which
+/// auto-opens that session if serve hasn't touched it yet — a real
+/// Tier-1 pull only if the on-disk store isn't already mirrored (an
+/// already-pulled store never spends one; see `sessions::open_session_at`'s
+/// `mirrored: meta_present`). `.figmog/current` unset ⇒ args unchanged,
+/// preserving today's serve-own-default behavior exactly.
+///
+/// Never applied to `figmog_open`: unlike every other tool, `figmog_open`'s
+/// own `file` argument names the file *to open*, not a routing hint — it's
+/// required, and direct mode's own dispatch correctly rejects an omitted
+/// one; silently defaulting it here would let `figmog call figmog_open`
+/// (no `--args`) succeed over the socket while the exact same invocation
+/// fails direct, breaking the very byte-compatibility this routing exists
+/// to preserve (see `dispatch::cmd_as_tool_call`'s caller).
+fn with_current_file(mut args: Value) -> Value {
+    if let Some(obj) = args.as_object_mut() {
+        let has_file = obj.get("file").is_some_and(|v| !v.is_null());
+        if !has_file && let Some(key) = read_current_key() {
+            obj.insert("file".to_string(), json!(key));
+        }
+    }
+    args
+}
+
+/// Drop every key whose value is JSON `null` from a routed read command's
+/// argument object (review C2): `json!` always emits a null-valued key for
+/// an absent `Option<T>` field rather than omitting it (e.g.
+/// `cmd_as_tool_call`'s `Cmd::Where` arm always has an `equals` key, `null`
+/// when `--equals` was omitted), but `dispatch_read_tool`'s arg helpers use
+/// *presence*, not truthiness — `figmog_where`'s `equals:
+/// args.get("equals").cloned()` treats a present-but-null `equals` as
+/// "match literal null" rather than "no filter", silently returning zero
+/// rows for the common no-`--equals` case over the socket while direct
+/// mode returns every row with that pointer present. Applied once,
+/// generically, to every `cmd_as_tool_call` translation — rather than
+/// hand-rolling conditional insertion in each match arm — so this class of
+/// bug can't recur as new routed commands are added. (One accepted
+/// imprecision: `--equals null` explicitly, an obscure invocation, is now
+/// indistinguishable from omitting `--equals` entirely, since both encode
+/// as a null-valued key before this strip runs either way — direct mode
+/// keeps the finer distinction via `Option<Value>` at the Rust level.)
+fn strip_nulls(mut args: Value) -> Value {
+    if let Some(obj) = args.as_object_mut() {
+        obj.retain(|_, v| !v.is_null());
+    }
+    args
+}
+
+/// Strip the server-spliced `upstream` field from a routed *read command's*
+/// result (review m1): `upstream` is only ever added inside
+/// `dispatch_read_tool`/`handle_tool_call` — the `figmog_status` *tool*'s
+/// own behavior, which the plain `figmog status` read command has never
+/// gone through (`read::cmd_status` calls `query::status` directly, with
+/// no splice at all) — so leaving it in a socket-routed `status` would
+/// make the two modes diverge on this one field even after every other fix
+/// here. A no-op for every other command's result, none of which carry
+/// this key. (`figmog call figmog_status` is unaffected: both modes go
+/// through `dispatch_read_tool` there, so both already carry `upstream`
+/// consistently — this strip is not applied to `Cmd::Call`.)
+fn strip_routed_upstream_field(mut result: Value) -> Value {
+    if let Some(obj) = result.as_object_mut() {
+        obj.remove("upstream");
+    }
+    result
+}
+
+/// Maps a read-only [`Cmd`] to the equivalent local `figmog_*` tool name +
+/// arguments `figmog serve` would answer over the socket (spec §1's CLI
+/// routing) — the exact argument shapes [`crate::dispatch::dispatch_read_tool`]
+/// expects, so a socket-routed read produces byte-identical results to the
+/// direct-open path below. `None` for every command socket routing doesn't
+/// apply to: `pull` is a writer (spec §1: "pull stays direct-open");
+/// `serve`/`tools`/`call`/`import-variables` are each handled at their own
+/// call sites (`serve`/`tools` before this is ever reached, `call` by
+/// `dispatch`'s own socket block above `import-variables` is a writer, like
+/// `pull`, and isn't part of spec §1's routed surface at all).
+fn cmd_as_tool_call(cmd: &Cmd) -> Option<(&'static str, Value)> {
+    match cmd {
+        Cmd::Status => Some(("figmog_status", json!({}))),
+        Cmd::Pages => Some(("figmog_pages", json!({}))),
+        Cmd::Tree { id, depth } => Some(("figmog_tree", json!({"id": id, "depth": depth}))),
+        Cmd::Get {
+            id,
+            children,
+            resolve_vars,
+        } => Some((
+            "figmog_node",
+            json!({"id": id, "children": children, "resolve_vars": resolve_vars}),
+        )),
+        Cmd::Dump {
+            id,
+            depth,
+            fields,
+            resolve_vars,
+        } => Some((
+            "figmog_subtree",
+            json!({"id": id, "depth": depth, "fields": fields, "resolve_vars": resolve_vars}),
+        )),
+        Cmd::Find {
+            node_type,
+            page,
+            under,
+        } => Some((
+            "figmog_find",
+            json!({"type": node_type, "page": page, "under": under}),
+        )),
+        Cmd::Search {
+            query,
+            limit,
+            under,
+        } => Some((
+            "figmog_search",
+            json!({"query": query, "limit": limit, "under": under}),
+        )),
+        Cmd::Instances { target } => Some(("figmog_instances", json!({"target": target}))),
+        Cmd::Components => Some(("figmog_components", json!({}))),
+        Cmd::Styles {
+            style_type,
+            values,
+            resolve_vars,
+        } => Some((
+            "figmog_styles",
+            json!({"type": style_type, "values": values, "resolve_vars": resolve_vars}),
+        )),
+        Cmd::Uses { id } => Some(("figmog_uses", json!({"id": id}))),
+        Cmd::Vars { id } => Some(("figmog_vars", json!({"id": id}))),
+        Cmd::Stats => Some(("figmog_stats", json!({}))),
+        Cmd::Path { id } => Some(("figmog_path", json!({"id": id}))),
+        Cmd::Text { page, under } => Some(("figmog_text", json!({"page": page, "under": under}))),
+        Cmd::Where {
+            pointer,
+            equals,
+            page,
+            under,
+        } => Some((
+            "figmog_where",
+            json!({
+                "pointer": pointer,
+                "equals": equals.as_deref().map(read::parse_equals),
+                "page": page,
+                "under": under,
+            }),
+        )),
+        Cmd::At { x, y } => Some(("figmog_at", json!({"x": x, "y": y}))),
+        Cmd::Pull { .. }
+        | Cmd::Serve { .. }
+        | Cmd::Tools { .. }
+        | Cmd::Call { .. }
+        | Cmd::ImportVariables { .. }
+        | Cmd::Images { .. } => None,
     }
 }
 
@@ -401,17 +784,26 @@ fn resolve_db(cli: &Cli) -> Result<Db, String> {
         });
     }
 
-    let key = std::fs::read_to_string(CURRENT_FILE)
-        .map_err(|_| no_mirror_msg(cli))?
-        .trim()
-        .to_string();
-    if key.is_empty() {
-        return Err(no_mirror_msg(cli));
-    }
+    let key = read_current_key().ok_or_else(|| no_mirror_msg(cli))?;
     Ok(Db {
         path: db_path_for(&key),
         key: Some(key),
     })
+}
+
+/// Best-effort read of `.figmog/current` — `None` on any I/O error or an
+/// empty file (the same "no established mirror" cases [`resolve_db`]
+/// turns into an error; socket routing instead treats `None` as "let
+/// serve's own default apply, unchanged" — see [`with_current_file`]).
+/// Shared so both call sites derive the current mirror identically.
+fn read_current_key() -> Option<String> {
+    let key = std::fs::read_to_string(CURRENT_FILE).ok()?;
+    let key = key.trim();
+    if key.is_empty() {
+        None
+    } else {
+        Some(key.to_string())
+    }
 }
 
 /// `pull --from-file` with neither a file ref nor an established key has
@@ -569,5 +961,52 @@ mod tests {
 
         let other_payload: Box<dyn std::any::Any + Send> = Box::new(42i32);
         assert_eq!(panic_message(&*other_payload), "unknown panic");
+    }
+
+    // ---- socket-routing helpers (review C1/C2/m1 fix round) ----
+
+    #[test]
+    fn strip_nulls_drops_null_keys_and_keeps_everything_else() {
+        let args = strip_nulls(json!({
+            "pointer": "/layoutMode",
+            "equals": null,
+            "page": null,
+            "under": "1:1",
+            "limit": 0,
+        }));
+        assert_eq!(
+            args,
+            json!({"pointer": "/layoutMode", "under": "1:1", "limit": 0})
+        );
+    }
+
+    #[test]
+    fn strip_nulls_is_a_no_op_on_an_object_with_no_nulls() {
+        let args = json!({"id": "1:1", "children": true});
+        assert_eq!(strip_nulls(args.clone()), args);
+    }
+
+    #[test]
+    fn strip_routed_upstream_field_removes_only_that_key() {
+        let result = strip_routed_upstream_field(json!({
+            "name": "Fixture",
+            "nodes": 12,
+            "upstream": "connected",
+        }));
+        assert_eq!(result, json!({"name": "Fixture", "nodes": 12}));
+    }
+
+    #[test]
+    fn strip_routed_upstream_field_is_a_no_op_when_absent() {
+        let result = json!({"name": "Fixture", "nodes": 12});
+        assert_eq!(strip_routed_upstream_field(result.clone()), result);
+    }
+
+    #[test]
+    fn with_current_file_never_overrides_an_explicit_non_null_file() {
+        // No filesystem dependency either way: an explicit `file` short-
+        // circuits before `read_current_key` is ever consulted.
+        let args = with_current_file(json!({"id": "1:1", "file": "explicitkey12345678"}));
+        assert_eq!(args["file"], json!("explicitkey12345678"));
     }
 }

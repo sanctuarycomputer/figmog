@@ -127,6 +127,24 @@ pub fn fixture_other() -> Value {
     })
 }
 
+/// [`fixture_v1`] with `fillGeometry`/`strokeGeometry` path data added to
+/// the Hero frame (`1:1`) — what a real `GET /v1/files/:key?geometry=paths`
+/// response carries on vector nodes (v0.0.2 spec §4) but a plain fetch
+/// omits. Used to prove `pull --geometry` keeps this data in `raw`; a
+/// synthetic stand-in, since the `--from-file` path this crate's tests use
+/// never actually issues the network request that decides whether it's
+/// present (see `api::file_url`'s own unit tests for that half).
+#[allow(dead_code)]
+pub fn fixture_with_geometry() -> Value {
+    let mut v = fixture_v1();
+    let hero = &mut v["document"]["children"][0]["children"][0];
+    hero["fillGeometry"] = json!([
+        {"path": "M0,0L800,0L800,400L0,400Z", "windingRule": "NONZERO"}
+    ]);
+    hero["strokeGeometry"] = json!([]);
+    v
+}
+
 /// Materialize [`fixture_v1`] into a DB via `pull --from-file` and return the
 /// (tempdir, db-path) pair every read command — CLI or `serve` — needs.
 /// Shared so `tests/cli.rs` and `tests/serve.rs` build the same fixture the
