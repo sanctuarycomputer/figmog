@@ -84,6 +84,34 @@ pub(super) fn tools_rows(tools: &[Value]) -> Value {
     Value::Array(rows)
 }
 
+/// Like [`try_call`], but for `figmog_images` specifically (v0.0.2 spec
+/// §5): returns the raw MCP `result` object (`{"content": [...],
+/// "isError": ...}`) rather than [`interpret_call_response`]'s unwrapped
+/// domain `Value`. `figmog_images`'s content mixes a text manifest block
+/// with `image` (base64) blocks — `interpret_call_response`'s "parse
+/// `content[0]`'s text as figmog's own JSON" contract only fits the
+/// single-text-block shape every other local tool returns, so
+/// `cli::images` (the only caller) needs the whole array to decode the
+/// image blocks and write files itself.
+pub(super) fn try_images_call(root: &Path, args: Value) -> Option<Result<Value, String>> {
+    let stream = UnixStream::connect(socket_path(root)).ok()?;
+    let resp = send_and_recv(
+        stream,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "figmog_images", "arguments": args},
+        }),
+    );
+    Some(resp.and_then(|resp| {
+        if let Some(err) = resp.get("error") {
+            return Err(protocol_error_message(err));
+        }
+        Ok(resp.get("result").cloned().unwrap_or(Value::Null))
+    }))
+}
+
 fn call_over(stream: UnixStream, tool: &str, args: Value) -> Result<Value, String> {
     let resp = send_and_recv(
         stream,

@@ -137,7 +137,7 @@ pub(super) fn cmd_call(
             .ok_or_else(|| format!("upstream not attached: {tool}"))?;
         let args_canonical = proxy::canonical_args(&args)?;
         let version_and_hit = if proxy::is_cacheable(&tool, &args) {
-            st.rtx(|(_, _, _, _, _, _, meta, cache, _)| {
+            st.rtx(|(_, _, _, _, _, _, meta, cache, _, _)| {
                 let version = meta.get(&0).map(|m| m.version.clone());
                 let hit = version
                     .as_ref()

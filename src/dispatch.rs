@@ -17,8 +17,8 @@ use serde_json::{Value, json};
 
 use crate::mcp::ToolDef;
 use crate::model::{
-    ComponentRec, ComponentSetRec, FileMeta, MirrorConfigRec, NodeRec, ProxyCacheRec, StyleRec,
-    VariableCollectionRec, VariableRec,
+    ComponentRec, ComponentSetRec, FileMeta, ImageBlobRec, MirrorConfigRec, NodeRec, ProxyCacheRec,
+    StyleRec, VariableCollectionRec, VariableRec,
 };
 use crate::query;
 
@@ -36,10 +36,11 @@ pub(crate) type NodeReaders<'a, R> = (
 );
 
 /// Read handles for the whole pipeline, in `figmog_pipeline!`'s top-level
-/// order — the exact tuple `st.rtx`'s closure receives. 9 elements: the
+/// order — the exact tuple `st.rtx`'s closure receives. 10 elements: the
 /// `nodes` branch bundle, then `components`, `component_sets`, `styles`,
 /// `variables`, `variable_collections`, `meta`, `proxy_cache`,
-/// `mirror_config` (v0.0.2 spec §4 — appended last, non-breaking).
+/// `mirror_config` (v0.0.2 spec §4), `images` (v0.0.2 spec §5 — appended
+/// last, non-breaking).
 pub(crate) type RootReaders<'a, R> = (
     NodeReaders<'a, R>,
     TableReader<'a, R, String, ComponentRec>,
@@ -50,6 +51,7 @@ pub(crate) type RootReaders<'a, R> = (
     TableReader<'a, R, u8, FileMeta>,
     TableReader<'a, R, String, ProxyCacheRec>,
     TableReader<'a, R, u8, MirrorConfigRec>,
+    TableReader<'a, R, String, ImageBlobRec>,
 );
 
 // ---- arg extraction ----
@@ -93,6 +95,44 @@ pub(crate) fn arg_usize(args: &Value, key: &str) -> Option<usize> {
 
 pub(crate) fn arg_bool(args: &Value, key: &str) -> bool {
     args.get(key).and_then(Value::as_bool).unwrap_or(false)
+}
+
+/// Optional numeric field — [`require_f64`]'s absent-is-`None` sibling,
+/// used by `figmog_images`'s optional `scale` (v0.0.2 spec §5).
+pub(crate) fn arg_f64(args: &Value, key: &str) -> Option<f64> {
+    args.get(key).and_then(Value::as_f64)
+}
+
+/// A required array-of-strings field — `figmog_images`'s `ids` (v0.0.2
+/// spec §5). Same present-but-wrong-type distinction as [`require_str`];
+/// additionally rejects an empty array (nothing to fetch) and a non-string
+/// element, both named precisely rather than surfacing as a generic
+/// downstream failure.
+pub(crate) fn require_str_array(args: &Value, key: &str) -> Result<Vec<String>, String> {
+    match args.get(key) {
+        None => Err(format!("missing required field: {key}")),
+        Some(Value::Array(items)) => {
+            if items.is_empty() {
+                return Err(format!("`{key}` must not be empty"));
+            }
+            items
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    v.as_str().map(str::to_string).ok_or_else(|| {
+                        format!(
+                            "expected string for `{key}[{i}]`, got {}",
+                            json_type_name(v)
+                        )
+                    })
+                })
+                .collect()
+        }
+        Some(other) => Err(format!(
+            "expected array for `{key}`, got {}",
+            json_type_name(other)
+        )),
+    }
 }
 
 /// See [`require_str`]'s doc comment — same present-but-wrong-type
@@ -146,6 +186,7 @@ pub(crate) fn dispatch_read_tool<R: Readable>(
         meta,
         _cache,
         _mirror_config,
+        _images,
     ) = r;
 
     match name {
@@ -292,14 +333,17 @@ fn file_arg_property() -> Value {
     })
 }
 
-/// The 20 `figmog_*` MCP tools (spec §14, v4; `figmog_subtree` added by
-/// v0.0.2 §2): 17 reads of the local mirror (`figmog_subtree` among them)
-/// plus `figmog_sync` — 18 total — every one of which gains the optional
-/// `file` routing property below — plus the two v4 additions, `figmog_open`
-/// and `figmog_files`, which don't (routing *to* a file, and listing every
+/// The 21 `figmog_*` MCP tools (spec §14, v4; `figmog_subtree` added by
+/// v0.0.2 §2, `figmog_images` by v0.0.2 §5): 17 reads of the local mirror
+/// (`figmog_subtree` among them) plus `figmog_sync` and `figmog_images` —
+/// 19 total — every one of which gains the optional `file` routing
+/// property below — plus the two v4 additions, `figmog_open` and
+/// `figmog_files`, which don't (routing *to* a file, and listing every
 /// file, aren't themselves per-file operations). Every tool but
-/// `figmog_sync`/`figmog_open` reads the local mirror at zero Figma API
-/// cost.
+/// `figmog_sync`/`figmog_open`/`figmog_images` reads the local mirror at
+/// zero Figma API cost — `figmog_images` is deliberately never called
+/// automatically by anything in figmog (spec §5: the images endpoints are
+/// Figma's most rate-limited).
 pub(crate) fn tool_registry() -> Vec<ToolDef> {
     let mut tools = vec![
         ToolDef {
@@ -467,6 +511,23 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
                     "under": {"type": "string", "description": "Scope to the subtree rooted at this node id (inclusive)."}
                 },
                 "required": ["pointer"]
+            }),
+        },
+        ToolDef {
+            name: "figmog_images",
+            description: "Download node renders and/or fill images (v0.0.2 spec §5), cached by file version — spends Figma API budget (the images endpoints are the most rate-limited; never called automatically). Returns image content blocks (base64) for items up to 1MB, plus a JSON manifest; larger items point at the CLI's `figmog images --out` instead.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Node ids (or Figma URLs carrying node-id=) to render, and/or to scan for fill imageRefs."
+                    },
+                    "format": {"type": "string", "description": "Render format: png or svg (default png)."},
+                    "scale": {"type": "number", "description": "Render scale (default 1)."}
+                },
+                "required": ["ids"]
             }),
         },
         ToolDef {

@@ -898,6 +898,21 @@ fn handle_tool_call(
                     e.message
                 })?;
 
+        if name == "figmog_images" {
+            // v0.0.2 spec §5: never automatic, and this is the only place
+            // that reaches `FileSession::images` — no other call site
+            // wires it in. `resolve` already spends this session's cache
+            // and, on a miss, its Figma API budget; a pull failure has no
+            // analog here (images doesn't pull the file), so unlike
+            // `figmog_sync`/`figmog_open` this never touches
+            // `next_deadline`.
+            let ids = dispatch::require_str_array(args, "ids")?;
+            let format = args.get("format").and_then(Value::as_str).unwrap_or("png");
+            let scale = dispatch::arg_f64(args, "scale");
+            let items = (session.images)(&ids, format, scale)?;
+            return Ok(ToolOutput::Raw(crate::images::to_mcp_content(&items)));
+        }
+
         if name == "figmog_sync" {
             // `resolve` already spent this call's one pull if the session
             // was new/unmirrored — skip the redundant second Tier-1 pull
@@ -1001,10 +1016,10 @@ mod tests {
         })]);
         let (tools, dropped) = proxy::merge_registry(local_registry(), upstream.tools());
         assert!(dropped.is_empty());
-        assert_eq!(tools.len(), 21);
-        assert!(tools[..20].iter().all(|t| t.name.starts_with("figmog_")));
-        assert_eq!(tools[20].name, "get_design_context");
-        assert!(tools[20].description.starts_with("[via Figma desktop] "));
+        assert_eq!(tools.len(), 22);
+        assert!(tools[..21].iter().all(|t| t.name.starts_with("figmog_")));
+        assert_eq!(tools[21].name, "get_design_context");
+        assert!(tools[21].description.starts_with("[via Figma desktop] "));
     }
 
     #[test]

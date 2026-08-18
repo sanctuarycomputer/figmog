@@ -70,6 +70,7 @@ fn enterprise_export_syncs_with_zero_churn_on_identical_repull() {
             _,
             _,
             _,
+            _,
         )| {
             let mut p = collect_sweepable(&nodes, &components, &component_sets, &styles);
             p.extend(collect_variable_ids(&variables, &variable_collections));
@@ -102,7 +103,7 @@ fn variable_removed_upstream_is_swept_when_export_present() {
         collect_sweepable(&nodes, &components, &component_sets, &styles)
     });
     sync(&mut st, &prior, &flattened, 1_000);
-    st.rtx(|(_, _, _, _, variables, _, _, _, _)| {
+    st.rtx(|(_, _, _, _, variables, _, _, _, _, _)| {
         assert_eq!(variables.iter().count(), 3);
     });
 
@@ -130,6 +131,7 @@ fn variable_removed_upstream_is_swept_when_export_present() {
             _,
             _,
             _,
+            _,
         )| {
             let mut p = collect_sweepable(&nodes, &components, &component_sets, &styles);
             p.extend(collect_variable_ids(&variables, &variable_collections));
@@ -139,7 +141,7 @@ fn variable_removed_upstream_is_swept_when_export_present() {
     let churn = sync(&mut st, &prior2, &flattened2, 2_000);
     assert_eq!(churn.removed, 1, "the dropped variable must be swept");
 
-    st.rtx(|(_, _, _, _, variables, collections, _, _, _)| {
+    st.rtx(|(_, _, _, _, variables, collections, _, _, _, _)| {
         assert!(
             variables.get(&"VariableID:200".to_string()).is_none(),
             "removed-upstream variable must be gone"
@@ -205,7 +207,7 @@ fn imported_variables_survive_pulls_with_no_export() {
     let churn = sync(&mut st, &prior, &flattened2, 2_000);
     assert_eq!(churn.removed, 0, "no export means nothing to sweep");
 
-    st.rtx(|(_, _, _, _, variables, collections, _, _, _)| {
+    st.rtx(|(_, _, _, _, variables, collections, _, _, _, _)| {
         assert!(
             variables.get(&"VariableID:100".to_string()).is_some(),
             "v1 behavior intact: imported variables survive a pull with no Enterprise export"

@@ -11,7 +11,7 @@ use fold::stream::KeyedStream;
 use serde::Serialize;
 
 use crate::flatten::Flattened;
-use crate::model::{FileMeta, Id, MirrorConfigRec, NodeRec, ProxyCacheRec, Rec};
+use crate::model::{FileMeta, Id, ImageBlobRec, MirrorConfigRec, NodeRec, ProxyCacheRec, Rec};
 
 // ---- pipeline branch functions (pure; fold requires determinism) ----
 
@@ -141,6 +141,15 @@ pub fn mirror_config_only(d: &Keyed<Id, Rec>) -> Option<Keyed<u8, MirrorConfigRe
     }
 }
 
+/// Feeds the `images` table: keep only `Rec::ImageBlob` records, keyed by
+/// their own hash (v0.0.2 spec §5) — same pattern as [`proxy_cache_only`].
+pub fn image_only(d: &Keyed<Id, Rec>) -> Option<Keyed<String, ImageBlobRec>> {
+    match (&d.key, &d.val) {
+        (Id::ImageBlob(k), Rec::ImageBlob(r)) => Some(Keyed::new(k.clone(), r.clone())),
+        _ => None,
+    }
+}
+
 /// The full figmog pipeline. Sink names are frozen on-disk schema.
 #[macro_export]
 macro_rules! figmog_pipeline {
@@ -200,6 +209,7 @@ macro_rules! figmog_pipeline {
                 $crate::store::mirror_config_only,
                 terminal::Table::new("mirror_config"),
             ),
+            FilterMap::new($crate::store::image_only, terminal::Table::new("images")),
         )
     }};
 }
@@ -339,13 +349,31 @@ pub fn stale_cache_ids<R: fold::stream::Readable>(
         .collect()
 }
 
-/// Remove `stale` cache rows in one write transaction. Never touches
-/// variables, collections, or the meta row — pass only ids gathered by
-/// [`stale_cache_ids`].
+/// `ImageBlob` rows whose `file_version` no longer matches
+/// `current_version` (v0.0.2 spec §5) — the sibling of [`stale_cache_ids`]
+/// for the `images` table, joining the same post-pull eviction step (see
+/// this section's own note above — cache and image eviction are both
+/// version-triggered, not file-sweep-triggered).
+pub fn stale_image_ids<R: fold::stream::Readable>(
+    images: &fold::pipeline::terminal::TableReader<'_, R, String, crate::model::ImageBlobRec>,
+    current_version: &str,
+) -> Vec<Id> {
+    images
+        .iter()
+        .filter(|(_, rec)| rec.file_version != current_version)
+        .map(|(k, _)| Id::ImageBlob(k))
+        .collect()
+}
+
+/// Remove `stale` rows in one write transaction. Never touches variables,
+/// collections, or the meta row — pass only ids gathered by
+/// [`stale_cache_ids`] and/or [`stale_image_ids`], the only two sources
+/// that feed this (both version-triggered, not file-sweep-triggered — see
+/// this section's own note above).
 pub fn evict_stale_cache<P: Push<Keyed<Id, Rec>>>(st: &mut KeyedStream<Id, Rec, P>, stale: &[Id]) {
     st.wtx(|tx| {
         for id in stale {
-            debug_assert!(matches!(id, Id::ProxyCache(_)));
+            debug_assert!(matches!(id, Id::ProxyCache(_) | Id::ImageBlob(_)));
             tx.remove(id);
         }
     });
@@ -358,8 +386,12 @@ pub fn evict_stale_cache<P: Push<Keyed<Id, Rec>>>(st: &mut KeyedStream<Id, Rec, 
 // component_sets/styles table readers, never `mirror_config` — this is a
 // structural property of that function's own argument list, not a runtime
 // check, so there's nothing to `debug_assert` against inside `sync` for it
-// (unlike `evict_stale_cache`'s `ProxyCache`-only assertion, which guards a
-// *caller-supplied* id list against passing the wrong table).
+// (unlike `evict_stale_cache`'s id-kind assertion, which guards a
+// *caller-supplied* id list against passing the wrong table). `images`
+// (v0.0.2 spec §5) is exempt from the same sweep for the identical
+// reason — it's a fourth table `collect_sweepable` never reads from —
+// and, like `proxy_cache`, has its own version-triggered eviction path
+// instead ([`stale_image_ids`] / [`evict_stale_cache`]).
 
 /// Read the stored geometry flag ([`MirrorConfigRec::geometry`]), or
 /// `false` when no row has ever been upserted (every pre-v0.0.2 store, and
@@ -419,11 +451,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut st = crate::open_store!(&dir.path().join("db"));
 
-        let absent = st.rtx(|(.., mirror_config)| read_geometry(&mirror_config));
+        let absent = st.rtx(|(.., mirror_config, _)| read_geometry(&mirror_config));
         assert!(!absent, "no row upserted yet ⇒ geometry defaults false");
 
         upsert_mirror_config(&mut st, true);
-        let now_true = st.rtx(|(.., mirror_config)| read_geometry(&mirror_config));
+        let now_true = st.rtx(|(.., mirror_config, _)| read_geometry(&mirror_config));
         assert!(now_true, "the upserted flag must be what a later read sees");
 
         // Sweep-exempt: `mirror_config` isn't among `collect_sweepable`'s
@@ -441,7 +473,7 @@ mod tests {
             collect_sweepable(&nodes, &components, &component_sets, &styles)
         });
         sync(&mut st, &prior, &flattened, 0);
-        let still_true = st.rtx(|(.., mirror_config)| read_geometry(&mirror_config));
+        let still_true = st.rtx(|(.., mirror_config, _)| read_geometry(&mirror_config));
         assert!(still_true, "mirror_config must survive an unrelated sweep");
     }
 }

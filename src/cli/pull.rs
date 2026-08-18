@@ -117,7 +117,7 @@ pub(super) fn do_pull(
                 false
             } else {
                 open_store_checked(|| crate::open_store!(&db.path))
-                    .map(|st| st.rtx(|(.., mirror_config)| store::read_geometry(&mirror_config)))
+                    .map(|st| st.rtx(|(.., mirror_config, _)| store::read_geometry(&mirror_config)))
                     .unwrap_or(false)
             };
             let request_geometry = store::effective_geometry(geometry, stored_geometry);
@@ -145,28 +145,37 @@ pub(super) fn do_pull(
     if let Some(v) = &vars_resp {
         let var_recs = crate::vars::parse_variables_export(v).map_err(|e| e.to_string())?;
         flattened.recs.extend(var_recs);
-        let stored_var_ids = st.rtx(|(_, _, _, _, variables, variable_collections, _, _, _)| {
-            collect_variable_ids(&variables, &variable_collections)
-        });
+        let stored_var_ids = st.rtx(
+            |(_, _, _, _, variables, variable_collections, _, _, _, _)| {
+                collect_variable_ids(&variables, &variable_collections)
+            },
+        );
         prior.extend(stored_var_ids);
     }
     let prior_version =
-        st.rtx(|(_, _, _, _, _, _, meta, _, _)| meta.get(&0).map(|m| m.version.clone()));
+        st.rtx(|(_, _, _, _, _, _, meta, _, _, _)| meta.get(&0).map(|m| m.version.clone()));
     let churn = sync(&mut st, &prior, &flattened, now_ms());
 
     // Every caller of `do_pull` (`pull` and `figmog call figmog_sync`) goes
     // through here, so eviction lives here rather than duplicated at each
     // call site (build design §12: a
-    // version-changing pull sweeps stale `proxy_cache` rows). `figmog
-    // serve`'s own pull paths don't call `do_pull` — they keep their own
-    // inline eviction blocks, since they already hold `st` open and
-    // re-opening it here would hit the same single-open-per-process wall
-    // `figmog call figmog_sync` used to.
+    // version-changing pull sweeps stale `proxy_cache` rows; v0.0.2 spec §5
+    // extends this to stale `images` rows the same way). `figmog serve`'s
+    // own pull paths don't call `do_pull` — they keep their own inline
+    // eviction blocks, since they already hold `st` open and re-opening it
+    // here would hit the same single-open-per-process wall `figmog call
+    // figmog_sync` used to.
     if prior_version.as_deref() != Some(flattened.file.version.as_str()) {
-        let stale = st.rtx(|(_, _, _, _, _, _, _, cache, _)| {
-            crate::store::stale_cache_ids(&cache, &flattened.file.version)
+        let mut stale = st.rtx(|(_, _, _, _, _, _, _, cache, _, images)| {
+            let mut stale = crate::store::stale_cache_ids(&cache, &flattened.file.version);
+            stale.extend(crate::store::stale_image_ids(
+                &images,
+                &flattened.file.version,
+            ));
+            stale
         });
         if !stale.is_empty() {
+            stale.sort();
             crate::store::evict_stale_cache(&mut st, &stale);
         }
     }
@@ -180,7 +189,7 @@ pub(super) fn do_pull(
     // function's doc comment). `--fresh` already wiped any prior row, so
     // this store's own current read is `false` there, giving exactly
     // `geometry` as the persisted value, same as the fetch decision above.
-    let stored_now = st.rtx(|(.., mirror_config)| store::read_geometry(&mirror_config));
+    let stored_now = st.rtx(|(.., mirror_config, _)| store::read_geometry(&mirror_config));
     store::upsert_mirror_config(&mut st, store::effective_geometry(geometry, stored_now));
 
     if let Some(key) = &db.key {

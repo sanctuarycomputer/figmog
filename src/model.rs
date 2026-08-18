@@ -22,9 +22,13 @@ pub enum Id {
     /// earlier in this enum would corrupt every existing store.
     ProxyCache(String),
     /// Sticky per-mirror settings row (v0.0.2 spec §4), one per store, like
-    /// [`Id::Meta`]. APPEND ONLY — see [`Id::ProxyCache`]'s note; this must
-    /// stay the last variant until the next one is appended after it.
+    /// [`Id::Meta`]. APPEND ONLY — see [`Id::ProxyCache`]'s note.
     MirrorConfig,
+    /// Cached image bytes (render or fill, v0.0.2 spec §5), keyed by
+    /// [`crate::images::image_key`]'s hash — same pattern as
+    /// [`Id::ProxyCache`]. APPEND ONLY — see that variant's note; this must
+    /// stay the last variant until the next one is appended after it.
+    ImageBlob(String),
 }
 
 /// One mirrored record; variant always matches its [`Id`] variant.
@@ -41,6 +45,8 @@ pub enum Rec {
     ProxyCache(ProxyCacheRec),
     /// See [`Id::MirrorConfig`]. APPEND ONLY — see that variant's note.
     MirrorConfig(MirrorConfigRec),
+    /// See [`Id::ImageBlob`]. APPEND ONLY — see that variant's note.
+    ImageBlob(ImageBlobRec),
 }
 
 /// One node of the document tree (children stripped from `raw`).
@@ -171,6 +177,41 @@ pub struct MirrorConfigRec {
     pub geometry: bool,
 }
 
+/// One cached image blob — a node render or a fill's referenced bytes
+/// (v0.0.2 spec §5). A hit requires `file_version` to equal the mirror's
+/// current [`FileMeta::version`], exactly like [`ProxyCacheRec`]; a
+/// version bump makes the row stale and eligible for eviction
+/// (`store::stale_image_ids` / `store::evict_stale_cache`).
+///
+/// Lives in its own append-only enum variant rather than widening an
+/// existing struct, for the same reason as [`MirrorConfigRec`] — see that
+/// type's doc comment and `CLAUDE.md`'s struct-vs-enum-append rule.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImageBlobRec {
+    /// Hash of `kind` + `subject` + `format` + `scale_milli`; identical to
+    /// the [`Id::ImageBlob`] key ([`crate::images::image_key`]).
+    pub key_hash: String,
+    /// `"render"` (a `GET /v1/images/:key` node render) or `"fill"` (a
+    /// `GET /v1/files/:key/images` fill image, addressed by its
+    /// `imageRef` hash).
+    pub kind: String,
+    /// Node id (`kind == "render"`) or `imageRef` hash (`kind == "fill"`).
+    pub subject: String,
+    /// Requested render format (`"png"`/`"svg"`/…), or the format
+    /// inferred from a fill's download URL — informational only for
+    /// fills, since [`crate::images::image_key`] never varies a fill's
+    /// cache key by format (Figma's fills endpoint takes no format
+    /// parameter; the same `imageRef` always resolves to the same bytes).
+    pub format: String,
+    /// Requested scale × 1000 (e.g. `scale: 1.5` ⇒ `1500`); always `1000`
+    /// for fills, which aren't scale-parameterized.
+    pub scale_milli: u32,
+    /// File version this blob was fetched at.
+    pub file_version: String,
+    /// The raw image bytes.
+    pub bytes: Vec<u8>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,15 +252,36 @@ mod tests {
         assert_eq!(rec, back);
     }
 
-    /// Postcard-append safety (v0.0.2 spec §4): a store written before
+    fn sample_image_blob() -> ImageBlobRec {
+        ImageBlobRec {
+            key_hash: "abc123".into(),
+            kind: "render".into(),
+            subject: "1:2".into(),
+            format: "png".into(),
+            scale_milli: 2000,
+            file_version: "100".into(),
+            bytes: vec![0x89, b'P', b'N', b'G'],
+        }
+    }
+
+    #[test]
+    fn image_blob_rec_postcard_roundtrip() {
+        let rec = Rec::ImageBlob(sample_image_blob());
+        let bytes = postcard::to_allocvec(&rec).unwrap();
+        let back: Rec = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(rec, back);
+    }
+
+    /// Postcard-append safety (v0.0.2 spec §4 + §5): a store written before
     /// `MirrorConfig` existed encoded `Rec::ProxyCache` at variant index 7
     /// (the 8th of 8 variants, 0-indexed) — postcard's enum encoding is a
     /// leading varint variant index, one byte for fewer than 128 variants.
     /// Appending `MirrorConfig` *after* `ProxyCache` must not move that
     /// index (it would corrupt every existing cache row's discriminant on
-    /// decode), and the new variant must land at the next free index (8).
-    /// A pre-change build isn't available to literally round-trip against,
-    /// so this pins the concrete byte instead — the same guarantee the
+    /// decode), and each new variant must land at the next free index (8
+    /// for `MirrorConfig`, 9 for the later-appended `ImageBlob`). A
+    /// pre-change build isn't available to literally round-trip against,
+    /// so this pins the concrete bytes instead — the same guarantee the
     /// append-only doc comments on `Id`/`Rec` assert, made checkable.
     #[test]
     fn append_only_preserves_existing_variant_indices() {
@@ -236,6 +298,10 @@ mod tests {
         let cfg = Rec::MirrorConfig(MirrorConfigRec { geometry: true });
         let bytes = postcard::to_allocvec(&cfg).unwrap();
         assert_eq!(bytes[0], 8, "MirrorConfig is the newly appended variant");
+
+        let img = Rec::ImageBlob(sample_image_blob());
+        let bytes = postcard::to_allocvec(&img).unwrap();
+        assert_eq!(bytes[0], 9, "ImageBlob is the newly appended variant");
     }
 
     #[test]

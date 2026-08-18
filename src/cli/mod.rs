@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 use crate::ident::parse_file_ref;
 
 mod call;
+mod images;
 mod pull;
 mod read;
 mod socket;
@@ -215,6 +216,22 @@ enum Cmd {
         #[arg(long)]
         y: f64,
     },
+    /// Download node renders and/or fill images to --out, caching by file
+    /// version (spec §5). Never automatic — the images endpoints are
+    /// Figma's most rate-limited.
+    Images {
+        /// Node ids (or Figma URLs carrying node-id=) to render, and/or
+        /// scan for fill imageRefs.
+        ids: Vec<String>,
+        #[arg(long, default_value = "png")]
+        format: String,
+        /// Render scale (default 1).
+        #[arg(long)]
+        scale: Option<f64>,
+        /// Output directory (default ./figmog-images/).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 /// Sentinel [`dispatch`]/[`write_json`] error string meaning "stdout
@@ -364,6 +381,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
     }
 
     let db = resolve_db(&cli)?;
+    let no_socket = cli.no_socket;
     match cli.cmd {
         Cmd::Pull {
             file,
@@ -372,6 +390,12 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             geometry,
         } => pull::cmd_pull(&db, file, from_file, fresh, geometry),
         Cmd::ImportVariables { path } => call::cmd_import_variables(&db, path),
+        Cmd::Images {
+            ids,
+            format,
+            scale,
+            out,
+        } => images::cmd_images(&db, no_socket, ids, format, scale, out),
         Cmd::Call {
             tool,
             args,
@@ -387,9 +411,11 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             // destructure an unconstrained associated type.
             let st = open_store_checked(|| crate::open_store!(&db.path))?;
             match other {
-                Cmd::Status => st.rtx(|((nodes, _, _, _, _, _, _), _, _, _, _, _, meta, _, _)| {
-                    read::cmd_status(&nodes, &meta)
-                }),
+                Cmd::Status => st.rtx(
+                    |((nodes, _, _, _, _, _, _), _, _, _, _, _, meta, _, _, _)| {
+                        read::cmd_status(&nodes, &meta)
+                    },
+                ),
                 Cmd::Pages => st
                     .rtx(|((nodes, _, _, _, _, _, by_type), ..)| read::cmd_pages(&nodes, &by_type)),
                 Cmd::Tree { id, depth } => {
@@ -491,7 +517,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
                     read::cmd_uses(&nodes, &styled_by, &bound_to, id)
                 }),
                 Cmd::Vars { id } => st.rtx(
-                    |((nodes, ..), _, _, _, variables, variable_collections, _, _, _)| {
+                    |((nodes, ..), _, _, _, variables, variable_collections, _, _, _, _)| {
                         read::cmd_vars(&nodes, &variables, &variable_collections, id)
                     },
                 ),
@@ -533,7 +559,8 @@ fn dispatch(cli: Cli) -> Result<(), String> {
                 | Cmd::ImportVariables { .. }
                 | Cmd::Serve { .. }
                 | Cmd::Tools { .. }
-                | Cmd::Call { .. } => {
+                | Cmd::Call { .. }
+                | Cmd::Images { .. } => {
                     unreachable!("handled above")
                 }
             }
@@ -719,7 +746,8 @@ fn cmd_as_tool_call(cmd: &Cmd) -> Option<(&'static str, Value)> {
         | Cmd::Serve { .. }
         | Cmd::Tools { .. }
         | Cmd::Call { .. }
-        | Cmd::ImportVariables { .. } => None,
+        | Cmd::ImportVariables { .. }
+        | Cmd::Images { .. } => None,
     }
 }
 

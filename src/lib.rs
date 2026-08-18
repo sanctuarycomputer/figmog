@@ -15,6 +15,7 @@ pub mod cli;
 mod dispatch;
 pub mod flatten;
 pub(crate) mod ident;
+pub mod images;
 pub(crate) mod mcp;
 pub mod model;
 mod proxy;

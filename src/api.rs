@@ -53,6 +53,38 @@ pub trait FigmaApi {
         let _ = key;
         Ok(None)
     }
+    /// `GET /v1/images/:key?ids=…&format=…[&scale=…]` (v0.0.2 spec §5) —
+    /// node renders. Unlike `variables_local`'s "not on this plan, and
+    /// that's fine" gating, an unimplemented render endpoint is a genuine
+    /// capability gap for any caller that reaches it, so the default
+    /// returns an error rather than `Ok(None)`: existing `FigmaApi` test
+    /// doubles built before this method existed (e.g. `watch::tests::
+    /// Script`) keep compiling without knowing renders exist at all, and
+    /// `crate::images::fetch` surfaces this as a normal per-item manifest
+    /// error rather than a panic if a caller ever did reach it.
+    fn images_render(
+        &self,
+        key: &str,
+        ids: &[String],
+        format: &str,
+        scale: Option<f64>,
+    ) -> Result<Value, ApiError> {
+        let _ = (key, ids, format, scale);
+        Err(ApiError::Http {
+            status: 501,
+            msg: "images_render not implemented".into(),
+        })
+    }
+    /// `GET /v1/files/:key/images` (v0.0.2 spec §5) — the file's fill
+    /// image hash→URL map. Same default-Err reasoning as
+    /// [`Self::images_render`].
+    fn file_image_fills(&self, key: &str) -> Result<Value, ApiError> {
+        let _ = key;
+        Err(ApiError::Http {
+            status: 501,
+            msg: "file_image_fills not implemented".into(),
+        })
+    }
 }
 
 pub(crate) fn parse_meta_response(v: &Value) -> Result<FileMetaResp, ApiError> {
@@ -85,6 +117,30 @@ pub(crate) fn file_url(key: &str, geometry: bool) -> String {
     } else {
         format!("/v1/files/{key}")
     }
+}
+
+/// `GET /v1/images/:key` request path (v0.0.2 spec §5) — comma-joined
+/// `ids`, `format`, and `scale` when given. Split out as a pure function
+/// for the same reason as [`file_url`]: unit-testable request-shape
+/// coverage without a live HTTP call.
+pub(crate) fn images_render_url(
+    key: &str,
+    ids: &[String],
+    format: &str,
+    scale: Option<f64>,
+) -> String {
+    let ids_param = ids.join(",");
+    let mut url = format!("/v1/images/{key}?ids={ids_param}&format={format}");
+    if let Some(s) = scale {
+        url.push_str(&format!("&scale={s}"));
+    }
+    url
+}
+
+/// `GET /v1/files/:key/images` request path (v0.0.2 spec §5) — the fill
+/// image hash→URL map, no query parameters.
+pub(crate) fn file_image_fills_url(key: &str) -> String {
+    format!("/v1/files/{key}/images")
 }
 
 pub(crate) fn error_from_status(status: u16, retry_after: Option<&str>, msg: String) -> ApiError {
@@ -145,6 +201,47 @@ impl FigmaApi for UreqApi {
             Err(e) if variables_local_is_gated(&e) => Ok(None),
             Err(e) => Err(e),
         }
+    }
+    fn images_render(
+        &self,
+        key: &str,
+        ids: &[String],
+        format: &str,
+        scale: Option<f64>,
+    ) -> Result<Value, ApiError> {
+        self.get_json(&images_render_url(key, ids, format, scale))
+    }
+    fn file_image_fills(&self, key: &str) -> Result<Value, ApiError> {
+        self.get_json(&file_image_fills_url(key))
+    }
+}
+
+/// Plain byte download for an already-resolved image URL (v0.0.2 spec
+/// §5): the URLs `images_render`/`file_image_fills` return are pre-signed
+/// S3 links, not `api.figma.com` — no `X-Figma-Token` header (S3 rejects
+/// an unexpected auth header on a pre-signed URL), and no `base_url`
+/// override (these are always absolute URLs from Figma's own response,
+/// never a path this crate constructs). A free function rather than a
+/// `FigmaApi` method: it isn't a Figma API call at all, and keeping it
+/// free lets `crate::images::fetch` accept it as a plain
+/// `&dyn Fn(&str) -> Result<Vec<u8>, ApiError>`, injectable by tests
+/// without a `FigmaApi` implementor standing in for a plain HTTP GET.
+pub fn download_bytes(url: &str) -> Result<Vec<u8>, ApiError> {
+    match ureq::get(url).call() {
+        Ok(resp) => {
+            let mut buf = Vec::new();
+            use std::io::Read;
+            resp.into_reader()
+                .read_to_end(&mut buf)
+                .map_err(|e| ApiError::Network(e.to_string()))?;
+            Ok(buf)
+        }
+        Err(ureq::Error::Status(status, resp)) => {
+            let retry = resp.header("Retry-After").map(str::to_string);
+            let msg = resp.into_string().unwrap_or_default();
+            Err(error_from_status(status, retry.as_deref(), msg))
+        }
+        Err(e) => Err(ApiError::Network(e.to_string())),
     }
 }
 
@@ -246,5 +343,43 @@ mod tests {
     fn file_url_adds_geometry_paths_only_when_requested() {
         assert_eq!(file_url("ABC123", false), "/v1/files/ABC123");
         assert_eq!(file_url("ABC123", true), "/v1/files/ABC123?geometry=paths");
+    }
+
+    // ---- image bytes (v0.0.2 spec §5) ----
+
+    #[test]
+    fn images_render_url_joins_ids_and_omits_scale_when_absent() {
+        let ids = vec!["1:2".to_string(), "1:3".to_string()];
+        assert_eq!(
+            images_render_url("ABC123", &ids, "png", None),
+            "/v1/images/ABC123?ids=1:2,1:3&format=png"
+        );
+    }
+
+    #[test]
+    fn images_render_url_appends_scale_when_given() {
+        let ids = vec!["1:2".to_string()];
+        assert_eq!(
+            images_render_url("ABC123", &ids, "svg", Some(2.0)),
+            "/v1/images/ABC123?ids=1:2&format=svg&scale=2"
+        );
+    }
+
+    #[test]
+    fn file_image_fills_url_has_no_query() {
+        assert_eq!(file_image_fills_url("ABC123"), "/v1/files/ABC123/images");
+    }
+
+    /// Default (unimplemented) `images_render`/`file_image_fills`
+    /// return an error, not `Ok(None)` — see this trait's own doc comment
+    /// on why that differs from `variables_local`'s default.
+    #[test]
+    fn default_images_render_and_file_image_fills_are_errors() {
+        assert!(
+            NoVariablesOverride
+                .images_render("ABC", &[], "png", None)
+                .is_err()
+        );
+        assert!(NoVariablesOverride.file_image_fills("ABC").is_err());
     }
 }

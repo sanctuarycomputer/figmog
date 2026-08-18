@@ -74,6 +74,15 @@ type WatermarkFn = Box<dyn FnMut() -> Option<String>>;
 type ProxyCacheFn = Box<
     dyn FnMut(&mut crate::upstream::HttpUpstream, &str, &Value) -> Result<(Value, bool), String>,
 >;
+/// `figmog_images` (v0.0.2 spec §5): `(ids, format, scale) ->` every
+/// requested render/fill, cache-first. A fifth closure beyond `dispatch`/
+/// `pull`/`watermark`/`proxy_cache`, for the same structural reason as
+/// `proxy_cache` — it needs this session's own store (for caching) *and*
+/// the network (for misses), so it can't be answered by `dispatch`
+/// (read-only) or folded into `pull` (a different fetch/cache shape
+/// entirely, and images is never automatic — see this type's own callers).
+type ImagesFn =
+    Box<dyn FnMut(&[String], &str, Option<f64>) -> Result<Vec<crate::images::ImageItem>, String>>;
 
 /// One mirrored Figma file. `dispatch` answers the 16 read-only
 /// `figmog_*` tools (everything [`dispatch::dispatch_read_tool`] knows);
@@ -103,6 +112,9 @@ type ProxyCacheFn = Box<
 /// from behind one of these closures. `serve.rs` calls it only for the
 /// *default* session — see its own doc comment for why proxied calls
 /// route through the default rather than any per-call `file` argument.
+///
+/// `images` (v0.0.2 spec §5) is a fifth — see [`ImagesFn`]'s own doc
+/// comment.
 pub(crate) struct FileSession {
     pub(crate) key: String,
     pub(crate) name: String,
@@ -110,6 +122,7 @@ pub(crate) struct FileSession {
     pub(crate) pull: PullFn,
     pub(crate) watermark: WatermarkFn,
     pub(crate) proxy_cache: ProxyCacheFn,
+    pub(crate) images: ImagesFn,
     pub(crate) watcher: Watcher,
     pub(crate) backoff: Duration,
     pub(crate) mirrored: bool,
@@ -228,7 +241,7 @@ pub(crate) fn open_session_at(
             // `geometry: true` keeps asking for it.
             let stored_geometry = st
                 .borrow()
-                .rtx(|(.., mirror_config)| store::read_geometry(&mirror_config));
+                .rtx(|(.., mirror_config, _)| store::read_geometry(&mirror_config));
             let request_geometry = store::effective_geometry(geometry_override, stored_geometry);
             let api = UreqApi::new(token);
             let resp = api.file(&key, request_geometry)?;
@@ -246,23 +259,29 @@ pub(crate) fn open_session_at(
             if let Some(v) = &vars_resp {
                 let var_recs = crate::vars::parse_variables_export(v).map_err(|e| e.to_string())?;
                 flattened.recs.extend(var_recs);
-                let stored_var_ids =
-                    st.rtx(|(_, _, _, _, variables, variable_collections, _, _, _)| {
+                let stored_var_ids = st.rtx(
+                    |(_, _, _, _, variables, variable_collections, _, _, _, _)| {
                         collect_variable_ids(&variables, &variable_collections)
-                    });
+                    },
+                );
                 prior.extend(stored_var_ids);
             }
             let churn = store::sync(&mut st, &prior, &flattened, now_ms());
 
             // Cache eviction lives here rather than folded into `sync`
             // (store.rs's own note): a version-changing pull sweeps stale
-            // `proxy_cache` rows; computing `stale` against the version
-            // just synced makes this a no-op whenever the version didn't
+            // `proxy_cache` rows (and, v0.0.2 spec §5, stale `images` rows
+            // the same way); computing `stale` against the version just
+            // synced makes this a no-op whenever the version didn't
             // actually move, with no separate "did it change" check needed.
             let version = flattened.file.version.clone();
-            let stale =
-                st.rtx(|(_, _, _, _, _, _, _, cache, _)| store::stale_cache_ids(&cache, &version));
+            let mut stale = st.rtx(|(_, _, _, _, _, _, _, cache, _, images)| {
+                let mut stale = store::stale_cache_ids(&cache, &version);
+                stale.extend(store::stale_image_ids(&images, &version));
+                stale
+            });
             if !stale.is_empty() {
+                stale.sort();
                 store::evict_stale_cache(&mut st, &stale);
             }
 
@@ -285,14 +304,14 @@ pub(crate) fn open_session_at(
 
     let meta_present = st
         .borrow()
-        .rtx(|(_, _, _, _, _, _, meta, _, _)| meta.get(&0).is_some());
+        .rtx(|(_, _, _, _, _, _, meta, _, _, _)| meta.get(&0).is_some());
     let name = st
         .borrow()
-        .rtx(|(_, _, _, _, _, _, meta, _, _)| meta.get(&0).map(|m| m.name.clone()))
+        .rtx(|(_, _, _, _, _, _, meta, _, _, _)| meta.get(&0).map(|m| m.name.clone()))
         .unwrap_or_else(|| key.clone());
     let seen = st
         .borrow()
-        .rtx(|(_, _, _, _, _, _, meta, _, _)| meta.get(&0).map(|m| m.last_modified.clone()));
+        .rtx(|(_, _, _, _, _, _, meta, _, _, _)| meta.get(&0).map(|m| m.last_modified.clone()));
 
     let dispatch: DispatchFn = {
         let st = st.clone();
@@ -317,8 +336,9 @@ pub(crate) fn open_session_at(
     let watermark: WatermarkFn = {
         let st = st.clone();
         Box::new(move || {
-            st.borrow()
-                .rtx(|(_, _, _, _, _, _, meta, _, _)| meta.get(&0).map(|m| m.last_modified.clone()))
+            st.borrow().rtx(|(_, _, _, _, _, _, meta, _, _, _)| {
+                meta.get(&0).map(|m| m.last_modified.clone())
+            })
         })
     };
 
@@ -327,7 +347,7 @@ pub(crate) fn open_session_at(
         Box::new(move |upstream, name, args| {
             let args_canonical = crate::proxy::canonical_args(args)?;
             let version_and_hit = if crate::proxy::is_cacheable(name, args) {
-                st.borrow().rtx(|(_, _, _, _, _, _, meta, cache, _)| {
+                st.borrow().rtx(|(_, _, _, _, _, _, meta, cache, _, _)| {
                     let version = meta.get(&0).map(|m| m.version.clone());
                     let hit = version
                         .as_ref()
@@ -342,6 +362,42 @@ pub(crate) fn open_session_at(
         })
     };
 
+    // `figmog_images` (v0.0.2 spec §5): the two-step `scan` (read-only,
+    // this session's own concrete `open_store!` handle — see
+    // `images.rs`'s own doc comment for why that split exists at all) then
+    // `resolve` (network + cache-write) dance, with the session's api
+    // token and network key exactly like `pull_closure` above. `api: None`
+    // when no token was configured at all — `resolve` itself still serves
+    // every cache hit for free in that case (see its own doc comment).
+    let images: ImagesFn = {
+        let st = st.clone();
+        let network_key = network_key.clone();
+        let token = token.clone();
+        Box::new(move |ids: &[String], format: &str, scale: Option<f64>| {
+            let key = network_key
+                .clone()
+                .ok_or_else(|| "no file key: pass a file key or figma.com URL".to_string())?;
+            let node_ids = crate::images::normalize_ids(ids);
+            let scale_m = crate::images::scale_milli(scale);
+            let mut st = st.borrow_mut();
+            let scanned = st.rtx(|((nodes, ..), _, _, _, _, _, meta, _, _, images)| {
+                crate::images::scan(&nodes, &meta, &images, &node_ids, format, scale_m)
+            });
+            let api = token.clone().map(UreqApi::new);
+            let download = crate::api::download_bytes;
+            Ok(crate::images::resolve(
+                &mut st,
+                scanned,
+                api.as_ref().map(|a| a as &dyn crate::api::FigmaApi),
+                &download,
+                &key,
+                &node_ids,
+                format,
+                scale,
+            ))
+        })
+    };
+
     Ok(FileSession {
         key,
         name,
@@ -349,6 +405,7 @@ pub(crate) fn open_session_at(
         pull,
         watermark,
         proxy_cache,
+        images,
         watcher: Watcher::new(seen),
         backoff: BACKOFF_START,
         mirrored: meta_present,
@@ -556,6 +613,9 @@ mod tests {
                 Err(format!(
                     "scripted session has no store to proxy through: {name}"
                 ))
+            }),
+            images: Box::new(|_ids, _format, _scale| {
+                Err("scripted session has no store for images".to_string())
             }),
             watcher: Watcher::new(None),
             backoff: BACKOFF_START,
@@ -853,6 +913,9 @@ mod tests {
                 Err(format!(
                     "scripted session has no store to proxy through: {name}"
                 ))
+            }),
+            images: Box::new(|_ids, _format, _scale| {
+                Err("scripted session has no store for images".to_string())
             }),
             watcher: Watcher::new(None),
             backoff: BACKOFF_START,

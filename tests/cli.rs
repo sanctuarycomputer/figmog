@@ -152,7 +152,7 @@ fn pull_geometry_flag_is_sticky_across_a_later_plain_pull() {
         .success();
     {
         let st = figmog::open_store!(&db_path);
-        let stored = st.rtx(|(.., mirror_config)| figmog::store::read_geometry(&mirror_config));
+        let stored = st.rtx(|(.., mirror_config, _)| figmog::store::read_geometry(&mirror_config));
         assert!(stored, "the --geometry pull must persist the flag");
     }
 
@@ -170,7 +170,7 @@ fn pull_geometry_flag_is_sticky_across_a_later_plain_pull() {
     {
         let st = figmog::open_store!(&db_path);
         let still_stored =
-            st.rtx(|(.., mirror_config)| figmog::store::read_geometry(&mirror_config));
+            st.rtx(|(.., mirror_config, _)| figmog::store::read_geometry(&mirror_config));
         assert!(still_stored, "a plain re-pull must not turn geometry off");
     }
 }
@@ -216,7 +216,7 @@ fn pull_fresh_turns_geometry_back_off() {
         .success();
 
     let st = figmog::open_store!(&db_path);
-    let stored = st.rtx(|(.., mirror_config)| figmog::store::read_geometry(&mirror_config));
+    let stored = st.rtx(|(.., mirror_config, _)| figmog::store::read_geometry(&mirror_config));
     assert!(!stored, "--fresh must reset the sticky geometry flag");
 }
 
@@ -583,9 +583,9 @@ fn import_variables_output_shape_is_the_variable_count_alone() {
 
 /// M6 (spec §4 debt ledger): `figmog tools`' JSON output shape — an array
 /// with one `{name, source, cacheable}` row per tool, nothing more.
-/// `--no-upstream` keeps this offline and deterministic: exactly the 20
-/// local `figmog_*` tools (v0.0.2 §2 added `figmog_subtree`), every one
-/// `source: "local"`.
+/// `--no-upstream` keeps this offline and deterministic: exactly the 21
+/// local `figmog_*` tools (v0.0.2 §2 added `figmog_subtree`, §5 added
+/// `figmog_images`), every one `source: "local"`.
 #[test]
 fn tools_output_shape_is_name_source_cacheable_rows() {
     let out = Command::cargo_bin("figmog")
@@ -595,7 +595,7 @@ fn tools_output_shape_is_name_source_cacheable_rows() {
         .success();
     let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
     let rows = v.as_array().expect("tools output is a JSON array");
-    assert_eq!(rows.len(), 20, "20 local figmog_* tools, no upstream");
+    assert_eq!(rows.len(), 21, "21 local figmog_* tools, no upstream");
     for row in rows {
         let obj = row.as_object().expect("each row is a JSON object");
         let keys: std::collections::BTreeSet<&str> = obj.keys().map(String::as_str).collect();
@@ -750,7 +750,7 @@ fn cli_pull_evicts_stale_cache_rows_on_version_change() {
             &serde_json::json!({"cached": true}),
         )
         .unwrap();
-        let hit = st.rtx(|(_, _, _, _, _, _, _, cache_reader, _)| {
+        let hit = st.rtx(|(_, _, _, _, _, _, _, cache_reader, _, _)| {
             cache::lookup(&cache_reader, "get_code", "{}", "100")
         });
         assert!(
@@ -780,7 +780,7 @@ fn cli_pull_evicts_stale_cache_rows_on_version_change() {
         .success();
 
     let st = figmog::open_store!(&db);
-    let evicted = st.rtx(|(_, _, _, _, _, _, _, cache_reader, _)| {
+    let evicted = st.rtx(|(_, _, _, _, _, _, _, cache_reader, _, _)| {
         cache::lookup(&cache_reader, "get_code", "{}", "100")
     });
     assert_eq!(
@@ -1297,4 +1297,89 @@ fn page_argument_accepts_a_full_figma_url() {
     );
     assert_eq!(bare.as_array().unwrap().len(), 1);
     assert_eq!(bare[0]["id"], "1:2");
+}
+
+// ---- figmog images (v0.0.2 spec §5) ----
+//
+// No automated live-network test anywhere in this crate's suite (spec §5;
+// see `images.rs`'s own module doc comment): `images::resolve`'s own unit
+// tests already exercise the full render/fill/eviction orchestration
+// against a scripted `FigmaApi` fake, so these e2e tests only need to
+// prove the CLI's offline-reachable surface — no serve running, no
+// FIGMA_TOKEN, socket routing never engaged.
+
+/// A mirror is established (`pull --from-file`, no network), but no
+/// FIGMA_TOKEN is set and no serve is running: every requested id is a
+/// cache miss, so `figmog images` must still print a manifest-shaped JSON
+/// array on stdout (never the generic `{"error": ...}` shape) with a
+/// per-item error naming FIGMA_TOKEN, and exit 1 (spec §5: partial/zero
+/// success is still manifest output, exit reflects success count alone).
+#[test]
+fn images_no_token_error_path_is_manifest_shaped_json_exit_1() {
+    let dir = tempfile::tempdir().unwrap();
+    let response = dir.path().join("resp.json");
+    std::fs::write(
+        &response,
+        serde_json::to_string(&common::fixture_v1()).unwrap(),
+    )
+    .unwrap();
+
+    Command::cargo_bin("figmog")
+        .unwrap()
+        .current_dir(dir.path())
+        .args([
+            "pull",
+            "flAtUnMfzvA5daBSTFQK35",
+            "--from-file",
+            response.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let out = Command::cargo_bin("figmog")
+        .unwrap()
+        .current_dir(dir.path())
+        .env_remove("FIGMA_TOKEN")
+        .args(["images", "1:2", "--no-socket"])
+        .assert()
+        .failure()
+        .code(1);
+
+    let stdout = out.get_output().stdout.clone();
+    let v: serde_json::Value = serde_json::from_slice(&stdout).unwrap_or_else(|e| {
+        panic!(
+            "stdout not JSON: {e}\nstdout: {}",
+            String::from_utf8_lossy(&stdout)
+        )
+    });
+    let rows = v.as_array().expect("manifest is a JSON array");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], "1:2");
+    assert_eq!(rows[0]["kind"], "render");
+    assert_eq!(rows[0]["cached"], false);
+    let error = rows[0]["error"].as_str().expect("error field present");
+    assert!(error.contains("FIGMA_TOKEN"), "error: {error}");
+    assert!(
+        rows[0].get("path").is_none(),
+        "nothing was written: {rows:?}"
+    );
+}
+
+/// A well-formed-looking file key with no established mirror at all: the
+/// CLI's own `resolve_db` fails before `cmd_images` is ever reached —
+/// still exit 1, but the generic `{"error": ...}` shape (no mirror to
+/// build a per-item manifest against), on stderr like every other command
+/// missing a mirror.
+#[test]
+fn images_with_no_established_mirror_fails_like_every_other_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = Command::cargo_bin("figmog")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["images", "1:2"])
+        .assert()
+        .failure()
+        .code(1);
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    assert!(stderr.contains("no mirror here"), "stderr: {stderr}");
 }
