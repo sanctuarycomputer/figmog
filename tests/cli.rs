@@ -375,8 +375,9 @@ fn import_variables_output_shape_is_the_variable_count_alone() {
 
 /// M6 (spec §4 debt ledger): `figmog tools`' JSON output shape — an array
 /// with one `{name, source, cacheable}` row per tool, nothing more.
-/// `--no-upstream` keeps this offline and deterministic: exactly the 19
-/// local `figmog_*` tools, every one `source: "local"`.
+/// `--no-upstream` keeps this offline and deterministic: exactly the 20
+/// local `figmog_*` tools (v0.0.2 §2 added `figmog_subtree`), every one
+/// `source: "local"`.
 #[test]
 fn tools_output_shape_is_name_source_cacheable_rows() {
     let out = Command::cargo_bin("figmog")
@@ -386,7 +387,7 @@ fn tools_output_shape_is_name_source_cacheable_rows() {
         .success();
     let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
     let rows = v.as_array().expect("tools output is a JSON array");
-    assert_eq!(rows.len(), 19, "19 local figmog_* tools, no upstream");
+    assert_eq!(rows.len(), 20, "20 local figmog_* tools, no upstream");
     for row in rows {
         let obj = row.as_object().expect("each row is a JSON object");
         let keys: std::collections::BTreeSet<&str> = obj.keys().map(String::as_str).collect();
@@ -664,4 +665,310 @@ fn json_flag_is_rejected_as_unknown() {
         stderr.contains("--json") || stderr.to_lowercase().contains("unexpected argument"),
         "expected clap to reject the removed --json flag: {stderr}"
     );
+}
+
+// ---- v0.0.2 §2: subtree dump ----
+
+#[test]
+fn dump_full_raw_json_nested_recursively_with_depth_and_fields_projection() {
+    let (_dir, db) = fixture_db();
+    let run = |args: &[&str]| {
+        let out = Command::cargo_bin("figmog")
+            .unwrap()
+            .args(args)
+            .args(["--db", &db])
+            .assert()
+            .success();
+        serde_json::from_slice::<serde_json::Value>(&out.get_output().stdout).unwrap()
+    };
+
+    // Unbounded depth (default): full raw JSON, children nested in
+    // child-index order.
+    let dump = run(&["dump", "1:1"]);
+    assert_eq!(dump["id"], "1:1");
+    assert_eq!(dump["layoutMode"], "VERTICAL"); // raw field preserved verbatim
+    let kids = dump["children"].as_array().unwrap();
+    assert_eq!(kids.len(), 2);
+    assert_eq!(kids[0]["id"], "1:2"); // Title, numeric child order
+    assert_eq!(kids[0]["characters"], "Welcome to the garden");
+    assert_eq!(kids[1]["id"], "1:3"); // Button
+
+    // depth 0: the node itself only; `children` is still present, just empty.
+    let dump0 = run(&["dump", "1:1", "--depth", "0"]);
+    assert_eq!(dump0["children"], serde_json::json!([]));
+    assert_eq!(dump0["layoutMode"], "VERTICAL");
+
+    // depth 1 from the page: one level down, grandchildren cut off.
+    let dump1 = run(&["dump", "0:1", "--depth", "1"]);
+    let page_kids = dump1["children"].as_array().unwrap();
+    assert_eq!(page_kids.len(), 2); // Hero (1:1), Old badge (1:9)
+    assert_eq!(page_kids[0]["id"], "1:1");
+    assert_eq!(
+        page_kids[0]["children"],
+        serde_json::json!([]),
+        "depth exhausted before Hero's own children"
+    );
+
+    // fields projection: only requested fields plus the always-kept set
+    // (id/name/type/children) survive.
+    let projected = run(&["dump", "1:1", "--fields", "layoutMode"]);
+    let keys: std::collections::BTreeSet<&str> = projected
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        ["id", "name", "type", "children", "layoutMode"]
+            .into_iter()
+            .collect(),
+        "fields projection keeps id/name/type/children always, plus requested fields"
+    );
+    assert_eq!(
+        projected["children"][0]["layoutMode"],
+        serde_json::Value::Null
+    );
+
+    // Unknown field names are silently absent, not an error.
+    let unknown = run(&["dump", "1:1", "--fields", "notAField"]);
+    assert!(!unknown.as_object().unwrap().contains_key("notAField"));
+    assert_eq!(unknown["id"], "1:1"); // still always-kept
+}
+
+#[test]
+fn dump_unknown_node_fails_cleanly() {
+    let (_dir, db) = fixture_db();
+    let out = Command::cargo_bin("figmog")
+        .unwrap()
+        .args(["dump", "99:99", "--db", &db])
+        .assert()
+        .failure()
+        .code(1);
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    assert!(stderr.contains("99:99"), "stderr: {stderr}");
+}
+
+// ---- v0.0.2 §3: --under subtree scoping ----
+
+#[test]
+fn under_scopes_find_text_search_where_and_intersects_with_page() {
+    let (_dir, db) = fixture_db();
+    let run = |args: &[&str]| {
+        let out = Command::cargo_bin("figmog")
+            .unwrap()
+            .args(args)
+            .args(["--db", &db])
+            .assert()
+            .success();
+        serde_json::from_slice::<serde_json::Value>(&out.get_output().stdout).unwrap()
+    };
+
+    // find --under: COMPONENT nodes live on page 0:2, outside 1:1's subtree.
+    let none = run(&["find", "--type", "COMPONENT", "--under", "1:1"]);
+    assert_eq!(none.as_array().unwrap().len(), 0);
+
+    // --under is inclusive of the scope root itself.
+    let inclusive = run(&["find", "--type", "FRAME", "--under", "1:1"]);
+    assert_eq!(inclusive.as_array().unwrap().len(), 1);
+    assert_eq!(inclusive[0]["id"], "1:1");
+
+    // text --under narrows to one page's subtree.
+    let text_under = run(&["text", "--under", "1:1"]);
+    assert_eq!(text_under.as_array().unwrap().len(), 1);
+    assert_eq!(text_under[0]["id"], "1:2");
+    let text_elsewhere = run(&["text", "--under", "2:1"]); // Button component set: no TEXT nodes
+    assert_eq!(text_elsewhere.as_array().unwrap().len(), 0);
+
+    // search --under.
+    let search_under = run(&["search", "garden", "--under", "1:1"]);
+    assert_eq!(search_under[0]["id"], "1:2");
+    let search_outside = run(&["search", "garden", "--under", "0:2"]);
+    assert_eq!(search_outside.as_array().unwrap().len(), 0);
+
+    // where --under.
+    let where_under = run(&[
+        "where",
+        "--pointer",
+        "/layoutMode",
+        "--equals",
+        "VERTICAL",
+        "--under",
+        "1:1",
+    ]);
+    assert_eq!(where_under.as_array().unwrap().len(), 1);
+    let where_outside = run(&[
+        "where",
+        "--pointer",
+        "/layoutMode",
+        "--equals",
+        "VERTICAL",
+        "--under",
+        "0:2",
+    ]);
+    assert_eq!(where_outside.as_array().unwrap().len(), 0);
+
+    // --under intersects with --page: page 0:2's TEXT nodes scoped under
+    // page 0:1's subtree is the empty intersection.
+    let intersected = run(&["find", "--type", "TEXT", "--page", "0:2", "--under", "0:1"]);
+    assert_eq!(
+        intersected.as_array().unwrap().len(),
+        0,
+        "page and under compose by intersection"
+    );
+}
+
+#[test]
+fn under_unknown_id_errors_cleanly() {
+    let (_dir, db) = fixture_db();
+    let out = Command::cargo_bin("figmog")
+        .unwrap()
+        .args(["find", "--type", "TEXT", "--under", "99:99", "--db", &db])
+        .assert()
+        .failure()
+        .code(1);
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    assert!(stderr.contains("99:99"), "stderr: {stderr}");
+}
+
+// ---- v0.0.2 §6: --resolve-vars ----
+
+#[test]
+fn resolve_vars_marks_bindings_unresolved_with_no_variables_table() {
+    let (_dir, db) = fixture_db();
+
+    // No import: both of 1:1's bound variables (fill color, paddingLeft)
+    // have no entry in the (empty) variables table.
+    let out = Command::cargo_bin("figmog")
+        .unwrap()
+        .args(["get", "1:1", "--resolve-vars", "--db", &db])
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let resolved = v["resolved_variables"].as_array().unwrap();
+    assert_eq!(resolved.len(), 2);
+    for entry in resolved {
+        assert_eq!(entry["source"], "unresolved");
+        assert!(
+            entry["variable_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("VariableID:")
+        );
+        assert!(entry.get("variable_name").is_none());
+    }
+}
+
+#[test]
+fn resolve_vars_resolves_imported_variables_on_get_dump_and_styles_values() {
+    let (dir, db) = fixture_db();
+    let export = dir.path().join("vars.json");
+    std::fs::write(&export, include_str!("fixtures/variables-export.json")).unwrap();
+    Command::cargo_bin("figmog")
+        .unwrap()
+        .args(["import-variables", export.to_str().unwrap(), "--db", &db])
+        .assert()
+        .success();
+
+    // `get --resolve-vars`: names + per-mode values from the imported table.
+    let out = Command::cargo_bin("figmog")
+        .unwrap()
+        .args(["get", "1:1", "--resolve-vars", "--db", &db])
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let resolved = v["resolved_variables"].as_array().unwrap();
+    assert_eq!(resolved.len(), 2);
+    let color = resolved
+        .iter()
+        .find(|e| e["variable_id"] == "VariableID:100")
+        .expect("fill color binding present");
+    assert_eq!(color["variable_name"], "color/surface/primary");
+    assert_eq!(color["values_by_mode"]["light"]["r"], 0.06);
+    assert_eq!(color["values_by_mode"]["dark"]["type"], "VARIABLE_ALIAS");
+    let padding = resolved
+        .iter()
+        .find(|e| e["variable_id"] == "VariableID:200")
+        .expect("paddingLeft binding present");
+    assert_eq!(padding["variable_name"], "space/md");
+    assert_eq!(padding["values_by_mode"]["default"], 16.0);
+
+    // `dump --resolve-vars`: same annotation, applied recursively.
+    let out = Command::cargo_bin("figmog")
+        .unwrap()
+        .args(["dump", "1:1", "--resolve-vars", "--db", &db])
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(v["resolved_variables"].as_array().unwrap().len(), 2);
+
+    // `styles --values --resolve-vars`: FILL style S:1's definition comes
+    // from consumer 1:1, whose /fills/0/color binding is VariableID:100 —
+    // paddingLeft (outside /fills) must not leak into this style's list.
+    let out = Command::cargo_bin("figmog")
+        .unwrap()
+        .args(["styles", "--values", "--resolve-vars", "--db", &db])
+        .assert()
+        .success();
+    let styles: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let fill_style = styles
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["style_id"] == "S:1")
+        .expect("FILL style S:1 present");
+    let fill_resolved = fill_style["resolved_variables"].as_array().unwrap();
+    assert_eq!(fill_resolved.len(), 1);
+    assert_eq!(fill_resolved[0]["variable_id"], "VariableID:100");
+    assert_eq!(fill_resolved[0]["variable_name"], "color/surface/primary");
+}
+
+// ---- v0.0.2 §2b: URL-addressed nodes ----
+
+#[test]
+fn get_dump_and_path_accept_a_full_figma_url_as_the_node_id() {
+    let (_dir, db) = fixture_db();
+    let url = "https://www.figma.com/design/flAtUnMfzvA5daBSTFQK35/Fixture?node-id=1-1&t=abc-1";
+
+    let bare = Command::cargo_bin("figmog")
+        .unwrap()
+        .args(["get", "1:1", "--db", &db])
+        .assert()
+        .success();
+    let bare: serde_json::Value = serde_json::from_slice(&bare.get_output().stdout).unwrap();
+
+    let via_url = Command::cargo_bin("figmog")
+        .unwrap()
+        .args(["get", url, "--db", &db])
+        .assert()
+        .success();
+    let via_url: serde_json::Value = serde_json::from_slice(&via_url.get_output().stdout).unwrap();
+    assert_eq!(
+        bare, via_url,
+        "a frame URL resolves to the same node as its bare id"
+    );
+
+    let dump_via_url = Command::cargo_bin("figmog")
+        .unwrap()
+        .args(["dump", url, "--depth", "0", "--db", &db])
+        .assert()
+        .success();
+    let dump_via_url: serde_json::Value =
+        serde_json::from_slice(&dump_via_url.get_output().stdout).unwrap();
+    assert_eq!(dump_via_url["id"], "1:1");
+
+    let path_via_url = Command::cargo_bin("figmog")
+        .unwrap()
+        .args(["path", url, "--db", &db])
+        .assert()
+        .success();
+    let path_via_url: serde_json::Value =
+        serde_json::from_slice(&path_via_url.get_output().stdout).unwrap();
+    let ids: Vec<&str> = path_via_url
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["0:0", "0:1", "1:1"]);
 }

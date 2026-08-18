@@ -242,15 +242,15 @@ fn serve_e2e_initialize_tools_list_and_tool_calls() {
         &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
     );
 
-    // -- tools/list: exactly 19 figmog_* tools (spec §14: the 17 v3 tools
-    // plus figmog_open/figmog_files) --
+    // -- tools/list: exactly 20 figmog_* tools (spec §14: the 17 v3 tools
+    // plus figmog_open/figmog_files, plus v0.0.2 §2's figmog_subtree) --
     send(
         &mut stdin,
         &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
     );
     let resp = recv(&rx);
     let tools = resp["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 19, "tools: {tools:#?}");
+    assert_eq!(tools.len(), 20, "tools: {tools:#?}");
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     for name in &names {
         assert!(
@@ -549,14 +549,14 @@ fn serve_e2e_proxied_tool_lists_round_trips_and_second_call_is_cache_served() {
         &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
     );
 
-    // -- tools/list: 19 local + 1 proxied, prefixed description --
+    // -- tools/list: 20 local + 1 proxied, prefixed description --
     send(
         &mut stdin,
         &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
     );
     let resp = recv(&rx);
     let tools = resp["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 20, "tools: {tools:#?}");
+    assert_eq!(tools.len(), 21, "tools: {tools:#?}");
     let proxied = tools
         .iter()
         .find(|t| t["name"] == json!("get_code"))
@@ -607,7 +607,7 @@ fn serve_e2e_proxied_tool_lists_round_trips_and_second_call_is_cache_served() {
 //
 // Two pre-built stores under a temp `--figmog-root` (built via `pull
 // --from-file --db <root>/<key>/db`, never touching the network), started
-// with BOTH keys as positional args, proves the whole v4 surface: 19 tools,
+// with BOTH keys as positional args, proves the whole v4 surface: 20 tools,
 // every local tool's optional `file` schema property, `figmog_files`,
 // `file`-argument routing to a *specific* mirror, default-file routing on
 // an omitted `file`, and `figmog_open`'s isError on a missing token. A
@@ -638,7 +638,7 @@ fn serve_e2e_multi_file_routes_by_file_arg_and_first_startup_key_is_default() {
         &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
     );
 
-    // -- tools/list: 19 tools; every tool but figmog_open/figmog_files
+    // -- tools/list: 20 tools; every tool but figmog_open/figmog_files
     // carries an *optional* `file` property, figmog_open's `file` is
     // required, figmog_files takes none (spec §14). --
     send(
@@ -647,7 +647,7 @@ fn serve_e2e_multi_file_routes_by_file_arg_and_first_startup_key_is_default() {
     );
     let resp = recv(&rx);
     let tools = resp["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 19, "tools: {tools:#?}");
+    assert_eq!(tools.len(), 20, "tools: {tools:#?}");
     for tool in tools {
         let name = tool["name"].as_str().expect("tool name");
         let schema = &tool["inputSchema"];
@@ -800,6 +800,76 @@ fn serve_e2e_multi_file_zero_startup_omitted_file_errors_naming_figmog_open() {
         text.contains("figmog_files"),
         "error should name figmog_files: {text}"
     );
+
+    drop(stdin);
+    let status = wait_with_timeout(&mut guard.0, TIMEOUT);
+    assert!(status.success(), "figmog serve exited with {status:?}");
+}
+
+/// spec §2b: a full Figma frame URL works directly as `id` on
+/// `figmog_node`/`figmog_subtree`, and — with no explicit `file` argument
+/// and no startup default (zero startup files here) — the URL's own file
+/// key auto-opens the right mirror (spec §14's existing auto-open
+/// semantics), exactly as if `file: KEY_A` had been passed explicitly.
+/// The mirror's store already exists on disk (pre-built by
+/// `build_fixture_root`), so this never touches the network.
+#[test]
+fn serve_e2e_zero_startup_url_id_infers_the_file_and_resolves_the_node() {
+    let root = build_fixture_root(&[(KEY_A, common::fixture_v1())]);
+    let (mut guard, mut stdin, rx) = spawn_serve_multifile(root.path(), &[]);
+
+    send(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "capabilities": {}},
+        }),
+    );
+    let resp = recv(&rx);
+    assert_eq!(resp["id"], json!(1));
+    send(
+        &mut stdin,
+        &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    );
+
+    // Nothing mirrored yet — the store on disk hasn't been opened as a
+    // session until a tool call names it.
+    let resp = call(&mut stdin, &rx, 2, "figmog_files", json!({}));
+    assert_eq!(result_json(&resp), json!([]));
+
+    let url = format!("https://www.figma.com/design/{KEY_A}/Fixture?node-id=1-1&t=abc-1");
+
+    // figmog_node: `id` alone (no `file`) resolves the Hero frame from
+    // KEY_A's mirror.
+    let resp = call(&mut stdin, &rx, 3, "figmog_node", json!({"id": url}));
+    assert_eq!(resp["result"]["isError"], json!(false), "resp: {resp:#?}");
+    let node = result_json(&resp);
+    assert_eq!(node["id"], json!("1:1"));
+    assert_eq!(node["name"], json!("Hero"));
+
+    // figmog_subtree: same URL, still no `file` — proves the auto-open
+    // isn't a one-shot fluke of the first call above.
+    let resp = call(
+        &mut stdin,
+        &rx,
+        4,
+        "figmog_subtree",
+        json!({"id": url, "depth": 0}),
+    );
+    assert_eq!(resp["result"]["isError"], json!(false), "resp: {resp:#?}");
+    let subtree = result_json(&resp);
+    assert_eq!(subtree["id"], json!("1:1"));
+    assert_eq!(subtree["children"], json!([]));
+
+    // The URL's file key really did auto-open a session, not answer from
+    // thin air.
+    let resp = call(&mut stdin, &rx, 5, "figmog_files", json!({}));
+    let rows = result_json(&resp);
+    let rows = rows.as_array().expect("files array");
+    assert_eq!(rows.len(), 1, "files: {rows:#?}");
+    assert_eq!(rows[0]["key"], json!(KEY_A));
 
     drop(stdin);
     let status = wait_with_timeout(&mut guard.0, TIMEOUT);

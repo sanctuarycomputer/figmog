@@ -111,19 +111,43 @@ enum Cmd {
         id: String,
         #[arg(long)]
         children: bool,
+        /// Annotate `boundVariables` binding sites with variable names and
+        /// per-mode values under a `resolved_variables` key.
+        #[arg(long)]
+        resolve_vars: bool,
     },
-    /// Nodes by type, optionally within one page.
+    /// Full raw JSON subtree dump rooted at a node (default depth: unlimited).
+    Dump {
+        id: String,
+        #[arg(long)]
+        depth: Option<usize>,
+        /// Project every node to these raw fields (id/name/type/children
+        /// always survive). Comma-separated, e.g. --fields id,name,fills.
+        #[arg(long, value_delimiter = ',')]
+        fields: Option<Vec<String>>,
+        /// Annotate `boundVariables` binding sites with variable names and
+        /// per-mode values under a `resolved_variables` key.
+        #[arg(long)]
+        resolve_vars: bool,
+    },
+    /// Nodes by type, optionally within one page and/or a subtree scope.
     Find {
         #[arg(long = "type")]
         node_type: String,
         #[arg(long)]
         page: Option<String>,
+        /// Scope to the subtree rooted at this node id (inclusive).
+        #[arg(long)]
+        under: Option<String>,
     },
     /// BM25 search over layer names and text content.
     Search {
         query: String,
         #[arg(short = 'n', long, default_value = "10")]
         limit: usize,
+        /// Scope to the subtree rooted at this node id (inclusive).
+        #[arg(long)]
+        under: Option<String>,
     },
     /// Instances of a component (by node id, key, or name).
     Instances { target: String },
@@ -135,6 +159,10 @@ enum Cmd {
         style_type: Option<String>,
         #[arg(long)]
         values: bool,
+        /// With --values, annotate the definition's variable bindings under
+        /// a `resolved_variables` key.
+        #[arg(long)]
+        resolve_vars: bool,
     },
     /// Nodes using a style id or bound to a variable id.
     Uses { id: String },
@@ -150,6 +178,9 @@ enum Cmd {
     Text {
         #[arg(long)]
         page: Option<String>,
+        /// Scope to the subtree rooted at this node id (inclusive).
+        #[arg(long)]
+        under: Option<String>,
     },
     /// Nodes whose raw JSON matches an RFC 6901 pointer, optionally by value.
     Where {
@@ -161,6 +192,9 @@ enum Cmd {
         equals: Option<String>,
         #[arg(long)]
         page: Option<String>,
+        /// Scope to the subtree rooted at this node id (inclusive).
+        #[arg(long)]
+        under: Option<String>,
     },
     /// Nodes whose absolute bounds contain a point, sorted by area ascending.
     At {
@@ -293,14 +327,52 @@ fn dispatch(cli: Cli) -> Result<(), String> {
                 Cmd::Get {
                     id,
                     children: with_children,
-                } => st.rtx(|((nodes, children, ..), ..)| {
-                    read::cmd_get(&nodes, &children, id, with_children)
+                    resolve_vars,
+                } => st.rtx(
+                    |((nodes, children, ..), _, _, _, variables, variable_collections, ..)| {
+                        read::cmd_get(
+                            &nodes,
+                            &children,
+                            &variables,
+                            &variable_collections,
+                            id,
+                            with_children,
+                            resolve_vars,
+                        )
+                    },
+                ),
+                Cmd::Dump {
+                    id,
+                    depth,
+                    fields,
+                    resolve_vars,
+                } => st.rtx(
+                    |((nodes, children, ..), _, _, _, variables, variable_collections, ..)| {
+                        read::cmd_dump(
+                            &nodes,
+                            &children,
+                            &variables,
+                            &variable_collections,
+                            id,
+                            depth,
+                            fields,
+                            resolve_vars,
+                        )
+                    },
+                ),
+                Cmd::Find {
+                    node_type,
+                    page,
+                    under,
+                } => st.rtx(|((nodes, children, _, _, _, _, by_type), ..)| {
+                    read::cmd_find(&nodes, &children, &by_type, node_type, page, under)
                 }),
-                Cmd::Find { node_type, page } => st.rtx(|((nodes, _, _, _, _, _, by_type), ..)| {
-                    read::cmd_find(&nodes, &by_type, node_type, page)
-                }),
-                Cmd::Search { query, limit } => st.rtx(|((nodes, _, text, ..), ..)| {
-                    read::cmd_search(&nodes, &text, query, limit)
+                Cmd::Search {
+                    query,
+                    limit,
+                    under,
+                } => st.rtx(|((nodes, children, text, ..), ..)| {
+                    read::cmd_search(&nodes, &children, &text, query, limit, under)
                 }),
                 Cmd::Instances { target } => st.rtx(
                     |((nodes, _, _, instances_of, ..), components, component_sets, ..)| {
@@ -316,11 +388,32 @@ fn dispatch(cli: Cli) -> Result<(), String> {
                 Cmd::Components => st.rtx(|((nodes, ..), components, component_sets, ..)| {
                     read::cmd_components(&component_sets, &components, &nodes)
                 }),
-                Cmd::Styles { style_type, values } => {
-                    st.rtx(|((nodes, _, _, _, styled_by, ..), _, _, styles, ..)| {
-                        read::cmd_styles(&styles, &styled_by, &nodes, style_type, values)
-                    })
-                }
+                Cmd::Styles {
+                    style_type,
+                    values,
+                    resolve_vars,
+                } => st.rtx(
+                    |(
+                        (nodes, _, _, _, styled_by, ..),
+                        _,
+                        _,
+                        styles,
+                        variables,
+                        variable_collections,
+                        ..,
+                    )| {
+                        read::cmd_styles(
+                            &styles,
+                            &styled_by,
+                            &nodes,
+                            &variables,
+                            &variable_collections,
+                            style_type,
+                            values,
+                            resolve_vars,
+                        )
+                    },
+                ),
                 Cmd::Uses { id } => st.rtx(|((nodes, _, _, _, styled_by, bound_to, _), ..)| {
                     read::cmd_uses(&nodes, &styled_by, &bound_to, id)
                 }),
@@ -349,14 +442,19 @@ fn dispatch(cli: Cli) -> Result<(), String> {
                     },
                 ),
                 Cmd::Path { id } => st.rtx(|((nodes, ..), ..)| read::cmd_path(&nodes, id)),
-                Cmd::Text { page } => st.rtx(|((nodes, _, _, _, _, _, by_type), ..)| {
-                    read::cmd_text(&nodes, &by_type, page)
-                }),
+                Cmd::Text { page, under } => {
+                    st.rtx(|((nodes, children, _, _, _, _, by_type), ..)| {
+                        read::cmd_text(&nodes, &children, &by_type, page, under)
+                    })
+                }
                 Cmd::Where {
                     pointer,
                     equals,
                     page,
-                } => st.rtx(|((nodes, ..), ..)| read::cmd_where(&nodes, pointer, equals, page)),
+                    under,
+                } => st.rtx(|((nodes, children, ..), ..)| {
+                    read::cmd_where(&nodes, &children, pointer, equals, page, under)
+                }),
                 Cmd::At { x, y } => st.rtx(|((nodes, ..), ..)| read::cmd_at(&nodes, x, y)),
                 Cmd::Pull { .. }
                 | Cmd::ImportVariables { .. }

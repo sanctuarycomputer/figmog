@@ -45,33 +45,74 @@ pub(super) fn cmd_tree<R: Readable>(
     print_value(&query::tree(nodes, children, by_type, id, depth)?)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn cmd_get<R: Readable>(
     nodes: &TableReader<'_, R, String, NodeRec>,
     children: &MultimapReader<'_, R, String, (u32, String)>,
+    variables: &TableReader<'_, R, String, VariableRec>,
+    variable_collections: &TableReader<'_, R, String, VariableCollectionRec>,
     id: String,
     with_children: bool,
+    resolve_vars: bool,
 ) -> Result<(), String> {
-    print_value(&query::node(nodes, children, id, with_children)?)
+    print_value(&query::node(
+        nodes,
+        children,
+        variables,
+        variable_collections,
+        id,
+        with_children,
+        resolve_vars,
+    )?)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn cmd_dump<R: Readable>(
+    nodes: &TableReader<'_, R, String, NodeRec>,
+    children: &MultimapReader<'_, R, String, (u32, String)>,
+    variables: &TableReader<'_, R, String, VariableRec>,
+    variable_collections: &TableReader<'_, R, String, VariableCollectionRec>,
+    id: String,
+    depth: Option<usize>,
+    fields: Option<Vec<String>>,
+    resolve_vars: bool,
+) -> Result<(), String> {
+    print_value(&query::subtree(
+        nodes,
+        children,
+        variables,
+        variable_collections,
+        id,
+        depth,
+        fields.as_deref(),
+        resolve_vars,
+    )?)
 }
 
 pub(super) fn cmd_find<R: Readable>(
     nodes: &TableReader<'_, R, String, NodeRec>,
+    children: &MultimapReader<'_, R, String, (u32, String)>,
     by_type: &InvertedIndexReader<'_, R, String, String>,
     node_type: String,
     page: Option<String>,
+    under: Option<String>,
 ) -> Result<(), String> {
-    print_value(&query::find(nodes, by_type, node_type, page)?)
+    print_value(&query::find(
+        nodes, children, by_type, node_type, page, under,
+    )?)
 }
 
 // ---- design-system reads ----
 
 pub(super) fn cmd_search<R: Readable>(
     nodes: &TableReader<'_, R, String, NodeRec>,
+    children: &MultimapReader<'_, R, String, (u32, String)>,
     text: &TextReader<'_, R>,
     query: String,
     limit: usize,
+    under: Option<String>,
 ) -> Result<(), String> {
-    print_value(&query::search(text, nodes, &query, limit)?)
+    print_value(&query::search(text, nodes, children, &query, limit, under)?)
 }
 
 pub(super) fn cmd_instances<R: Readable>(
@@ -98,15 +139,26 @@ pub(super) fn cmd_components<R: Readable>(
     print_value(&query::components(nodes, components, component_sets)?)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn cmd_styles<R: Readable>(
     styles: &TableReader<'_, R, String, StyleRec>,
     styled_by: &InvertedIndexReader<'_, R, String, String>,
     nodes: &TableReader<'_, R, String, NodeRec>,
+    variables: &TableReader<'_, R, String, VariableRec>,
+    variable_collections: &TableReader<'_, R, String, VariableCollectionRec>,
     style_type: Option<String>,
     values: bool,
+    resolve_vars: bool,
 ) -> Result<(), String> {
     print_value(&query::styles(
-        nodes, styles, styled_by, style_type, values,
+        nodes,
+        styles,
+        styled_by,
+        variables,
+        variable_collections,
+        style_type,
+        values,
+        resolve_vars,
     )?)
 }
 
@@ -163,20 +215,27 @@ pub(super) fn cmd_path<R: Readable>(
 
 pub(super) fn cmd_text<R: Readable>(
     nodes: &TableReader<'_, R, String, NodeRec>,
+    children: &MultimapReader<'_, R, String, (u32, String)>,
     by_type: &InvertedIndexReader<'_, R, String, String>,
     page: Option<String>,
+    under: Option<String>,
 ) -> Result<(), String> {
-    print_value(&query::text(nodes, by_type, page)?)
+    print_value(&query::text(nodes, children, by_type, page, under)?)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn cmd_where<R: Readable>(
     nodes: &TableReader<'_, R, String, NodeRec>,
+    children: &MultimapReader<'_, R, String, (u32, String)>,
     pointer: String,
     equals: Option<String>,
     page: Option<String>,
+    under: Option<String>,
 ) -> Result<(), String> {
     let equals = equals.as_deref().map(parse_equals);
-    print_value(&query::where_(nodes, &pointer, equals, page)?)
+    print_value(&query::where_(
+        nodes, children, &pointer, equals, page, under,
+    )?)
 }
 
 pub(super) fn cmd_at<R: Readable>(

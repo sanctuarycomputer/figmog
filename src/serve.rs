@@ -33,7 +33,7 @@
 //!
 //! **v3 (build design §12):** unless `--no-upstream`, figmog also probes
 //! Figma's native desktop MCP server at startup and becomes the *only*
-//! Figma MCP an agent needs — `tools/list` merges the 19 local `figmog_*`
+//! Figma MCP an agent needs — `tools/list` merges the 20 local `figmog_*`
 //! tools with every upstream tool verbatim (`proxy::merge_registry`), and
 //! `tools/call` routes by the namespace rule (`proxy::is_local_tool`).
 //! Upstream routing is global, not per-session: the desktop server serves
@@ -470,7 +470,16 @@ fn handle_tool_call(
         })));
     }
 
-    let file_arg = args.get("file").and_then(Value::as_str).map(str::to_string);
+    // spec §2b: an explicit `file` arg always wins, but when it's absent
+    // and the call's node-id-shaped argument (`id`/`under`/`target`) is a
+    // full Figma URL naming a file, that URL's file key routes the call
+    // (auto-open semantics apply, same as an explicit `file`). When both
+    // are present and disagree, the explicit arg still wins — the
+    // disagreement is only surfaced as a note on a not-found error below,
+    // never silently overridden the other way.
+    let explicit_file = args.get("file").and_then(Value::as_str).map(str::to_string);
+    let url_file_key = dispatch::infer_file_from_node_ref(args);
+    let file_arg = explicit_file.clone().or_else(|| url_file_key.clone());
     let mut call_args = args.clone();
     if let Some(obj) = call_args.as_object_mut() {
         obj.remove("file");
@@ -507,7 +516,21 @@ fn handle_tool_call(
             return Ok(ToolOutput::Json(churn_value));
         }
 
-        let result = (session.dispatch)(name, &call_args)?;
+        let result = (session.dispatch)(name, &call_args).map_err(|msg| {
+            // spec §2b: note an explicit-file/URL-file disagreement on a
+            // failed call (almost always "no node ... in the mirror" —
+            // the node genuinely isn't in the file the explicit arg
+            // picked) rather than staying silent about why a URL that
+            // looks right didn't resolve.
+            match (&explicit_file, &url_file_key) {
+                (Some(ef), Some(uf)) if ef != uf => {
+                    format!(
+                        "{msg} (note: the id/under URL names file {uf}, but the explicit `file` argument {ef} was used instead)"
+                    )
+                }
+                _ => msg,
+            }
+        })?;
         if name == "figmog_status"
             && let ToolOutput::Json(mut v) = result
         {
@@ -564,10 +587,10 @@ mod tests {
         })]);
         let (tools, dropped) = proxy::merge_registry(local_registry(), upstream.tools());
         assert!(dropped.is_empty());
-        assert_eq!(tools.len(), 20);
-        assert!(tools[..19].iter().all(|t| t.name.starts_with("figmog_")));
-        assert_eq!(tools[19].name, "get_design_context");
-        assert!(tools[19].description.starts_with("[via Figma desktop] "));
+        assert_eq!(tools.len(), 21);
+        assert!(tools[..20].iter().all(|t| t.name.starts_with("figmog_")));
+        assert_eq!(tools[20].name, "get_design_context");
+        assert!(tools[20].description.starts_with("[via Figma desktop] "));
     }
 
     #[test]

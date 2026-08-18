@@ -1,7 +1,7 @@
 //! One source of truth for every read answer — shared by the CLI printers
 //! and the MCP tools.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use serde_json::{Value, json};
 
@@ -9,7 +9,7 @@ use fold::pipeline::terminal::search::Bm25Reader;
 use fold::pipeline::terminal::{InvertedIndexReader, MultimapReader, TableReader};
 use fold::stream::Readable;
 
-use crate::ident::normalize_node_id;
+use crate::ident::{normalize_node_id, normalize_node_ref};
 use crate::model::{
     ComponentRec, ComponentSetRec, FileMeta, NodeRec, StyleRec, VariableCollectionRec, VariableRec,
 };
@@ -17,6 +17,108 @@ use crate::model::{
 /// Read handle for the pipeline's `text` BM25 sink (its tokenizer type
 /// param makes the full type unwieldy at every call site).
 pub type TextReader<'tx, R> = Bm25Reader<'tx, R, String, fn(&str, &mut Vec<u8>)>;
+
+/// BFS the `children` index from `scope_root` (inclusive), collecting the
+/// descendant id set — the shared engine behind `--under` scoping (spec
+/// §3). Cycle-safe via the visited set, same discipline as `path`/
+/// `depth_of`'s `parent_id` walks: a corrupted store with a `children`
+/// cycle can't loop forever, it just stops re-queuing an id it's already
+/// visited. Unknown `scope_root` is the caller's job to reject (via
+/// `nodes.get` before calling this) so the error message names the right
+/// argument.
+fn scope_ids<R: Readable>(
+    children: &MultimapReader<'_, R, String, (u32, String)>,
+    scope_root: &str,
+) -> BTreeSet<String> {
+    let mut visited: BTreeSet<String> = BTreeSet::new();
+    let mut queue: VecDeque<String> = VecDeque::new();
+    visited.insert(scope_root.to_string());
+    queue.push_back(scope_root.to_string());
+    while let Some(current) = queue.pop_front() {
+        for (_, child_id) in children.get(&current) {
+            if visited.insert(child_id.clone()) {
+                queue.push_back(child_id);
+            }
+        }
+    }
+    visited
+}
+
+/// Resolve an optional `--under <id>` scope argument to the descendant id
+/// set it names (root inclusive), or `None` when no scope was requested.
+/// Unknown id ⇒ the standard "no node … in the mirror" error (spec §3).
+fn resolve_under<R: Readable>(
+    nodes: &TableReader<'_, R, String, NodeRec>,
+    children: &MultimapReader<'_, R, String, (u32, String)>,
+    under: Option<String>,
+) -> Result<Option<BTreeSet<String>>, String> {
+    match under {
+        None => Ok(None),
+        Some(raw) => {
+            let id = normalize_node_ref(&raw);
+            nodes
+                .get(&id)
+                .ok_or_else(|| format!("no node {id} in the mirror"))?;
+            Ok(Some(scope_ids(children, &id)))
+        }
+    }
+}
+
+/// One `boundVariables` binding site resolved against the variables table
+/// (spec §6): `{pointer, variable_id, variable_name, values_by_mode}` when
+/// the variable is known (imported or Enterprise-synced), else
+/// `{pointer, variable_id, source: "unresolved"}`. Never errors — an
+/// unresolved binding is a normal, expected outcome on the free plan.
+fn resolve_variable_binding<R: Readable>(
+    variables: &TableReader<'_, R, String, VariableRec>,
+    variable_collections: &TableReader<'_, R, String, VariableCollectionRec>,
+    pointer: &str,
+    variable_id: &str,
+) -> Value {
+    match variables.get(&variable_id.to_string()) {
+        Some(var) => {
+            let collection = variable_collections.get(&var.collection_id);
+            let mut values_by_mode = serde_json::Map::new();
+            for (mode_id, val_str) in &var.values_by_mode {
+                let mode_name = collection
+                    .as_ref()
+                    .and_then(|c| c.modes.iter().find(|(mid, _)| mid == mode_id))
+                    .map(|(_, name)| name.clone())
+                    .unwrap_or_else(|| mode_id.clone());
+                let val: Value = serde_json::from_str(val_str).unwrap_or(Value::Null);
+                values_by_mode.insert(mode_name, val);
+            }
+            json!({
+                "pointer": pointer,
+                "variable_id": variable_id,
+                "variable_name": var.name,
+                "values_by_mode": Value::Object(values_by_mode),
+            })
+        }
+        None => json!({
+            "pointer": pointer,
+            "variable_id": variable_id,
+            "source": "unresolved",
+        }),
+    }
+}
+
+/// `resolved_variables` array for a node's (or a style's) full set of
+/// `boundVariables` binding sites, in the sorted order `bound_variables`
+/// already carries (model.rs's determinism contract) — never re-sorted.
+fn resolved_variables<R: Readable>(
+    variables: &TableReader<'_, R, String, VariableRec>,
+    variable_collections: &TableReader<'_, R, String, VariableCollectionRec>,
+    bound_variables: &[(String, String)],
+) -> Value {
+    let arr: Vec<Value> = bound_variables
+        .iter()
+        .map(|(pointer, vid)| {
+            resolve_variable_binding(variables, variable_collections, pointer, vid)
+        })
+        .collect();
+    Value::Array(arr)
+}
 
 /// File name, version, last modified, node count.
 pub fn status<R: Readable>(
@@ -110,7 +212,7 @@ pub fn tree_nodes<R: Readable>(
     depth: Option<usize>,
 ) -> Result<TreeNode, String> {
     let start = match id {
-        Some(raw) => normalize_node_id(&raw),
+        Some(raw) => normalize_node_ref(&raw),
         None => {
             let mut docs = by_type.search(&"DOCUMENT".to_string());
             docs.sort();
@@ -137,14 +239,19 @@ pub fn tree<R: Readable>(
     Ok(tree_to_json(&t))
 }
 
-/// Full raw JSON of one node, optionally with a `children` summary array.
+/// Full raw JSON of one node, optionally with a `children` summary array
+/// and/or a `resolved_variables` annotation (spec §6) of every
+/// `boundVariables` binding site on this node.
 pub fn node<R: Readable>(
     nodes: &TableReader<'_, R, String, NodeRec>,
     children: &MultimapReader<'_, R, String, (u32, String)>,
+    variables: &TableReader<'_, R, String, VariableRec>,
+    variable_collections: &TableReader<'_, R, String, VariableCollectionRec>,
     id: String,
     with_children: bool,
+    resolve_vars: bool,
 ) -> Result<Value, String> {
-    let id = normalize_node_id(&id);
+    let id = normalize_node_ref(&id);
     let n = nodes
         .get(&id)
         .ok_or_else(|| format!("no node {id} in the mirror"))?;
@@ -166,26 +273,146 @@ pub fn node<R: Readable>(
         }
     }
 
+    if resolve_vars && let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            "resolved_variables".to_string(),
+            resolved_variables(variables, variable_collections, &n.bound_variables),
+        );
+    }
+
     Ok(value)
 }
 
-/// Nodes by type, optionally within one page.
+/// Top-level raw fields a `fields` projection keeps regardless of whether
+/// they were named (spec §2): `id`/`name`/`type` because a projected node
+/// must stay identifiable. `children` isn't listed here — `raw` never
+/// carries a `children` field (flatten strips it), and [`build_subtree`]
+/// always adds it back after projection, so it survives unconditionally
+/// without needing a name-check.
+const SUBTREE_ALWAYS_FIELDS: [&str; 3] = ["id", "name", "type"];
+
+/// Project a subtree node's raw JSON object down to `fields` plus the
+/// always-kept set. Unknown field names are simply absent, not an error —
+/// spec §2's "agents probe freely" contract. A non-object `value` (should
+/// never happen for a real Figma node) passes through unchanged.
+fn project_raw_fields(mut value: Value, fields: &[String]) -> Value {
+    if let Value::Object(ref mut map) = value {
+        map.retain(|k, _| {
+            SUBTREE_ALWAYS_FIELDS.contains(&k.as_str()) || fields.iter().any(|f| f == k)
+        });
+    }
+    value
+}
+
+/// Recursive worker behind [`subtree`]: raw JSON of `n`, fields-projected,
+/// with `children` nested in child-index order and (when requested)
+/// `resolved_variables` — both inserted *after* projection so they always
+/// survive a `fields` filter, matching `id`/`name`/`type`.
+#[allow(clippy::too_many_arguments)]
+fn build_subtree<R: Readable>(
+    nodes: &TableReader<'_, R, String, NodeRec>,
+    children: &MultimapReader<'_, R, String, (u32, String)>,
+    variables: &TableReader<'_, R, String, VariableRec>,
+    variable_collections: &TableReader<'_, R, String, VariableCollectionRec>,
+    n: &NodeRec,
+    depth: Option<usize>,
+    fields: Option<&[String]>,
+    resolve_vars: bool,
+) -> Result<Value, String> {
+    let mut value: Value = serde_json::from_str(&n.raw).map_err(|e| e.to_string())?;
+    if let Some(fs) = fields {
+        value = project_raw_fields(value, fs);
+    }
+
+    let mut kids_json = Vec::new();
+    if depth != Some(0) {
+        let mut edges = children.get(&n.id);
+        edges.sort();
+        let next_depth = depth.map(|d| d - 1);
+        for (_, child_id) in edges {
+            if let Some(child) = nodes.get(&child_id) {
+                kids_json.push(build_subtree(
+                    nodes,
+                    children,
+                    variables,
+                    variable_collections,
+                    &child,
+                    next_depth,
+                    fields,
+                    resolve_vars,
+                )?);
+            }
+        }
+    }
+
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("children".to_string(), Value::Array(kids_json));
+        if resolve_vars {
+            obj.insert(
+                "resolved_variables".to_string(),
+                resolved_variables(variables, variable_collections, &n.bound_variables),
+            );
+        }
+    }
+
+    Ok(value)
+}
+
+/// Subtree dump rooted at `id` (spec §2): the node's full raw JSON with
+/// `children: [...]` nested recursively in child-index order, to `depth`
+/// levels (default: unlimited). `fields` projects every node to the named
+/// raw fields (`id`/`name`/`type`/`children` always survive); `None` skips
+/// projection entirely. `resolve_vars` adds a `resolved_variables`
+/// annotation (spec §6) to every node.
+#[allow(clippy::too_many_arguments)]
+pub fn subtree<R: Readable>(
+    nodes: &TableReader<'_, R, String, NodeRec>,
+    children: &MultimapReader<'_, R, String, (u32, String)>,
+    variables: &TableReader<'_, R, String, VariableRec>,
+    variable_collections: &TableReader<'_, R, String, VariableCollectionRec>,
+    id: String,
+    depth: Option<usize>,
+    fields: Option<&[String]>,
+    resolve_vars: bool,
+) -> Result<Value, String> {
+    let id = normalize_node_ref(&id);
+    let root = nodes
+        .get(&id)
+        .ok_or_else(|| format!("no node {id} in the mirror"))?;
+    build_subtree(
+        nodes,
+        children,
+        variables,
+        variable_collections,
+        &root,
+        depth,
+        fields,
+        resolve_vars,
+    )
+}
+
+/// Nodes by type, optionally within one page and/or scoped to `under`'s
+/// subtree (spec §3: intersects with the page filter).
 pub fn find<R: Readable>(
     nodes: &TableReader<'_, R, String, NodeRec>,
+    children: &MultimapReader<'_, R, String, (u32, String)>,
     by_type: &InvertedIndexReader<'_, R, String, String>,
     node_type: String,
     page: Option<String>,
+    under: Option<String>,
 ) -> Result<Value, String> {
     // Figma node types are stored uppercase; normalize so `--type frame`
     // matches the same as `--type FRAME`.
     let mut ids = by_type.search(&node_type.to_uppercase());
     ids.sort();
     let page = page.as_deref().map(normalize_node_id);
+    let scope = resolve_under(nodes, children, under)?;
 
     let mut rows: Vec<(String, String, String)> = ids
         .into_iter()
         .filter_map(|id| nodes.get(&id))
         .filter(|n| page.as_deref().is_none_or(|p| n.page_id == p))
+        .filter(|n| scope.as_ref().is_none_or(|s| s.contains(&n.id)))
         .map(|n| (n.id, n.name, n.page_id))
         .collect();
     rows.sort();
@@ -197,17 +424,26 @@ pub fn find<R: Readable>(
     Ok(Value::Array(arr))
 }
 
-/// BM25 search over layer names and text content.
+/// BM25 search over layer names and text content, optionally scoped to
+/// `under`'s subtree (spec §3). `limit` still caps the BM25 index's own
+/// top-N *before* the scope filter runs (that ranking, not this filter, is
+/// the expensive part) — a scoped call can return fewer than `limit` hits
+/// when some of the top matches fall outside `under`, same as every other
+/// filter here composing with a cap.
 pub fn search<R: Readable>(
     text: &TextReader<'_, R>,
     nodes: &TableReader<'_, R, String, NodeRec>,
+    children: &MultimapReader<'_, R, String, (u32, String)>,
     query: &str,
     limit: usize,
+    under: Option<String>,
 ) -> Result<Value, String> {
+    let scope = resolve_under(nodes, children, under)?;
     // BM25's own ranking order is deterministic; keep it (do not re-sort).
     let hits = text.search(query, limit);
     let rows: Vec<Value> = hits
         .iter()
+        .filter(|hit| scope.as_ref().is_none_or(|s| s.contains(&hit.val)))
         .filter_map(|hit| {
             let node = nodes.get(&hit.val)?;
             let snippet = node
@@ -281,7 +517,7 @@ pub fn instances<R: Readable>(
     instances_of: &InvertedIndexReader<'_, R, String, String>,
     target: &str,
 ) -> Result<Value, String> {
-    let target = normalize_node_id(target);
+    let target = normalize_node_ref(target);
     let component_ids = resolve_component_ids(components, component_sets, &target);
 
     let mut instance_ids: BTreeSet<String> = BTreeSet::new();
@@ -342,12 +578,20 @@ pub fn components<R: Readable>(
 }
 
 /// Styles with usage counts; `values` derives definitions from consumers.
+/// `resolve_vars` (with `values`) adds a `resolved_variables` annotation
+/// (spec §6) of the variable bindings under that definition's own raw-JSON
+/// pointer prefix (e.g. a FILL style's bindings live under `/fills`) — a
+/// no-op without `values`, since there's no definition to annotate.
+#[allow(clippy::too_many_arguments)]
 pub fn styles<R: Readable>(
     nodes: &TableReader<'_, R, String, NodeRec>,
     styles: &TableReader<'_, R, String, StyleRec>,
     styled_by: &InvertedIndexReader<'_, R, String, String>,
+    variables: &TableReader<'_, R, String, VariableRec>,
+    variable_collections: &TableReader<'_, R, String, VariableCollectionRec>,
     style_type: Option<String>,
     values: bool,
+    resolve_vars: bool,
 ) -> Result<Value, String> {
     let mut rows: Vec<(String, StyleRec)> = styles.iter().collect();
     rows.sort_by(|a, b| a.0.cmp(&b.0));
@@ -368,12 +612,27 @@ pub fn styles<R: Readable>(
                 "uses": consumers.len(),
             });
             if values {
-                let value = consumers
-                    .first()
-                    .and_then(|nid| nodes.get(nid))
+                let consumer = consumers.first().and_then(|nid| nodes.get(nid));
+                let value = consumer
+                    .as_ref()
                     .and_then(|n| crate::vars::style_value_from_consumer(&s.style_type, &n.raw))
                     .unwrap_or(Value::Null);
                 obj["value"] = value;
+
+                if resolve_vars {
+                    let prefix = crate::vars::style_value_pointer(&s.style_type);
+                    let bound: Vec<(String, String)> = consumer
+                        .map(|n| {
+                            n.bound_variables
+                                .iter()
+                                .filter(|(p, _)| prefix.is_some_and(|pre| p.starts_with(pre)))
+                                .cloned()
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    obj["resolved_variables"] =
+                        resolved_variables(variables, variable_collections, &bound);
+                }
             }
             obj
         })
@@ -542,7 +801,7 @@ pub fn path<R: Readable>(
     nodes: &TableReader<'_, R, String, NodeRec>,
     id: String,
 ) -> Result<Value, String> {
-    let id = normalize_node_id(&id);
+    let id = normalize_node_ref(&id);
     let mut chain: Vec<NodeRec> = Vec::new();
     let mut visited: BTreeSet<String> = BTreeSet::new();
     let mut current = id.clone();
@@ -570,20 +829,25 @@ pub fn path<R: Readable>(
 }
 
 /// Every TEXT node's `(id, characters, page_id)`, optionally scoped to one
-/// page, sorted by id.
+/// page and/or `under`'s subtree (spec §3: intersects with the page
+/// filter), sorted by id.
 pub fn text<R: Readable>(
     nodes: &TableReader<'_, R, String, NodeRec>,
+    children: &MultimapReader<'_, R, String, (u32, String)>,
     by_type: &InvertedIndexReader<'_, R, String, String>,
     page: Option<String>,
+    under: Option<String>,
 ) -> Result<Value, String> {
     let mut ids = by_type.search(&"TEXT".to_string());
     ids.sort();
     let page = page.as_deref().map(normalize_node_id);
+    let scope = resolve_under(nodes, children, under)?;
 
     let mut rows: Vec<(String, String, String)> = ids
         .into_iter()
         .filter_map(|id| nodes.get(&id))
         .filter(|n| page.as_deref().is_none_or(|p| n.page_id == p))
+        .filter(|n| scope.as_ref().is_none_or(|s| s.contains(&n.id)))
         .map(|n| (n.id, n.text.clone().unwrap_or_default(), n.page_id))
         .collect();
     rows.sort();
@@ -598,13 +862,16 @@ pub fn text<R: Readable>(
 }
 
 /// Nodes whose `raw` JSON matches an RFC 6901 pointer, optionally by value
-/// and/or scoped to one page. Rows `[{id, name, type, page_id, value}]`,
+/// and/or scoped to one page and/or `under`'s subtree (spec §3: intersects
+/// with the page filter). Rows `[{id, name, type, page_id, value}]`,
 /// sorted by id.
 pub fn where_<R: Readable>(
     nodes: &TableReader<'_, R, String, NodeRec>,
+    children: &MultimapReader<'_, R, String, (u32, String)>,
     pointer: &str,
     equals: Option<Value>,
     page: Option<String>,
+    under: Option<String>,
 ) -> Result<Value, String> {
     if !pointer.starts_with('/') {
         return Err(format!(
@@ -612,10 +879,14 @@ pub fn where_<R: Readable>(
         ));
     }
     let page = page.as_deref().map(normalize_node_id);
+    let scope = resolve_under(nodes, children, under)?;
 
     let mut rows: Vec<(String, String, String, String, Value)> = Vec::new();
     for (_, n) in nodes.iter() {
         if !page.as_deref().is_none_or(|p| n.page_id == p) {
+            continue;
+        }
+        if !scope.as_ref().is_none_or(|s| s.contains(&n.id)) {
             continue;
         }
         let raw: Value = serde_json::from_str(&n.raw).map_err(|e| e.to_string())?;
