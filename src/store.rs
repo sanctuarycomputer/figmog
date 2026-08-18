@@ -11,7 +11,7 @@ use fold::stream::KeyedStream;
 use serde::Serialize;
 
 use crate::flatten::Flattened;
-use crate::model::{FileMeta, Id, NodeRec, ProxyCacheRec, Rec};
+use crate::model::{FileMeta, Id, MirrorConfigRec, NodeRec, ProxyCacheRec, Rec};
 
 // ---- pipeline branch functions (pure; fold requires determinism) ----
 
@@ -132,6 +132,15 @@ pub fn meta_only(d: &Keyed<Id, Rec>) -> Option<Keyed<u8, FileMeta>> {
     }
 }
 
+/// Feeds the `mirror_config` table: the single [`MirrorConfigRec`] row
+/// (v0.0.2 spec §4), keyed by `0u8` — same reasoning as [`meta_only`].
+pub fn mirror_config_only(d: &Keyed<Id, Rec>) -> Option<Keyed<u8, MirrorConfigRec>> {
+    match &d.val {
+        Rec::MirrorConfig(m) => Some(Keyed::new(0u8, m.clone())),
+        _ => None,
+    }
+}
+
 /// The full figmog pipeline. Sink names are frozen on-disk schema.
 #[macro_export]
 macro_rules! figmog_pipeline {
@@ -186,6 +195,10 @@ macro_rules! figmog_pipeline {
             FilterMap::new(
                 $crate::store::proxy_cache_only,
                 terminal::Table::new("proxy_cache"),
+            ),
+            FilterMap::new(
+                $crate::store::mirror_config_only,
+                terminal::Table::new("mirror_config"),
             ),
         )
     }};
@@ -336,4 +349,99 @@ pub fn evict_stale_cache<P: Push<Keyed<Id, Rec>>>(st: &mut KeyedStream<Id, Rec, 
             tx.remove(id);
         }
     });
+}
+
+// ---- sticky vector geometry (v0.0.2 spec §4) ----
+//
+// `mirror_config` is exempt from `sync`'s sweep the same way `meta` is:
+// `collect_sweepable` (above) draws only from the nodes/components/
+// component_sets/styles table readers, never `mirror_config` — this is a
+// structural property of that function's own argument list, not a runtime
+// check, so there's nothing to `debug_assert` against inside `sync` for it
+// (unlike `evict_stale_cache`'s `ProxyCache`-only assertion, which guards a
+// *caller-supplied* id list against passing the wrong table).
+
+/// Read the stored geometry flag ([`MirrorConfigRec::geometry`]), or
+/// `false` when no row has ever been upserted (every pre-v0.0.2 store, and
+/// any store never pulled with `--geometry`).
+pub fn read_geometry<R: fold::stream::Readable>(
+    cfg: &fold::pipeline::terminal::TableReader<'_, R, u8, MirrorConfigRec>,
+) -> bool {
+    cfg.get(&0).map(|c| c.geometry).unwrap_or(false)
+}
+
+/// Upsert the sticky geometry flag in its own write transaction — a
+/// separate `wtx` from `sync`'s (mirroring `evict_stale_cache`'s own
+/// separation, see that section's note above): this is config bookkeeping
+/// about the *pull itself*, not part of the flattened file's record set
+/// `sync` reconciles.
+pub fn upsert_mirror_config<P: Push<Keyed<Id, Rec>>>(
+    st: &mut KeyedStream<Id, Rec, P>,
+    geometry: bool,
+) {
+    st.wtx(|tx| {
+        tx.upsert(
+            &Id::MirrorConfig,
+            &Rec::MirrorConfig(MirrorConfigRec { geometry }),
+        );
+    });
+}
+
+/// What a pull should request from Figma, given this call's own override
+/// (`--geometry` / `figmog_open`'s `geometry` arg / a plain re-pull's
+/// implicit `false`) and whatever's already stored: once either side is
+/// `true`, geometry stays on (spec §4 — sticky; the documented way back
+/// off is `pull --fresh`, whose callers pass `stored = false` here without
+/// even reading the about-to-be-wiped store).
+pub fn effective_geometry(flag: bool, stored: bool) -> bool {
+    flag || stored
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn effective_geometry_is_sticky_once_either_side_is_true() {
+        assert!(!effective_geometry(false, false));
+        assert!(effective_geometry(true, false));
+        assert!(effective_geometry(false, true));
+        assert!(effective_geometry(true, true));
+    }
+
+    /// Store-level proof that the stored flag alone drives a later pull's
+    /// choice (spec §4 stickiness): absent config reads `false`, an upsert
+    /// makes it stick, and reading it again — the exact shape
+    /// `cli::pull::do_pull`/`sessions::open_session_at`'s pull closure both
+    /// perform before deciding what to request — reflects the write.
+    #[test]
+    fn mirror_config_defaults_false_and_persists_once_upserted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = crate::open_store!(&dir.path().join("db"));
+
+        let absent = st.rtx(|(.., mirror_config)| read_geometry(&mirror_config));
+        assert!(!absent, "no row upserted yet ⇒ geometry defaults false");
+
+        upsert_mirror_config(&mut st, true);
+        let now_true = st.rtx(|(.., mirror_config)| read_geometry(&mirror_config));
+        assert!(now_true, "the upserted flag must be what a later read sees");
+
+        // Sweep-exempt: `mirror_config` isn't among `collect_sweepable`'s
+        // sources, so an ordinary `sync` sweep (even one whose live set is
+        // empty) must never remove it — mirroring `meta`'s own exemption.
+        let flattened = Flattened {
+            recs: Vec::new(),
+            file: crate::flatten::FileInfo {
+                name: "F".into(),
+                version: "1".into(),
+                last_modified: "t".into(),
+            },
+        };
+        let prior = st.rtx(|((nodes, ..), components, component_sets, styles, ..)| {
+            collect_sweepable(&nodes, &components, &component_sets, &styles)
+        });
+        sync(&mut st, &prior, &flattened, 0);
+        let still_true = st.rtx(|(.., mirror_config)| read_geometry(&mirror_config));
+        assert!(still_true, "mirror_config must survive an unrelated sweep");
+    }
 }

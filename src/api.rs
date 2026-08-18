@@ -35,8 +35,15 @@ pub struct FileMetaResp {
 pub trait FigmaApi {
     /// `GET /v1/files/:key/meta` — Tier 3, cheap enough to poll.
     fn file_meta(&self, key: &str) -> Result<FileMetaResp, ApiError>;
-    /// `GET /v1/files/:key` — Tier 1, the full document tree.
-    fn file(&self, key: &str) -> Result<Value, ApiError>;
+    /// `GET /v1/files/:key` — Tier 1, the full document tree. `geometry`
+    /// (v0.0.2 spec §4) adds `?geometry=paths`, so vector nodes carry
+    /// `fillGeometry`/`strokeGeometry` path data in the response — the
+    /// caller (`cli::pull::do_pull`, `sessions`'s pull closure) is
+    /// responsible for combining this call's own override with whatever
+    /// geometry setting is already stored (`store::effective_geometry`)
+    /// before deciding what to pass here; this trait method itself just
+    /// forwards the bit to the request.
+    fn file(&self, key: &str, geometry: bool) -> Result<Value, ApiError>;
     /// `GET /v1/files/:key/variables/local` — Enterprise-only. `Ok(None)`
     /// means "not available on this plan" (never an error: `pull` falls
     /// back to v1 behavior). The default implementation always returns
@@ -62,6 +69,22 @@ pub(crate) fn parse_meta_response(v: &Value) -> Result<FileMetaResp, ApiError> {
         name: get("name")?,
         last_touched_at: get("last_touched_at")?,
     })
+}
+
+/// `GET /v1/files/:key` request path, with `?geometry=paths` appended when
+/// `geometry` (v0.0.2 spec §4). Split out from [`UreqApi::file`] as a pure
+/// function so the query-parameter construction is unit-testable without a
+/// live HTTP call — `UreqApi::with_base_url` has no fixture server to
+/// assert against in this crate's test suite, so this is the seam that
+/// proves the request shape (spec §4's stickiness tests lean on this for
+/// the "what would this pull have asked for" half; the from-file path
+/// never issues the request at all).
+pub(crate) fn file_url(key: &str, geometry: bool) -> String {
+    if geometry {
+        format!("/v1/files/{key}?geometry=paths")
+    } else {
+        format!("/v1/files/{key}")
+    }
 }
 
 pub(crate) fn error_from_status(status: u16, retry_after: Option<&str>, msg: String) -> ApiError {
@@ -113,8 +136,8 @@ impl FigmaApi for UreqApi {
     fn file_meta(&self, key: &str) -> Result<FileMetaResp, ApiError> {
         parse_meta_response(&self.get_json(&format!("/v1/files/{key}/meta"))?)
     }
-    fn file(&self, key: &str) -> Result<Value, ApiError> {
-        self.get_json(&format!("/v1/files/{key}"))
+    fn file(&self, key: &str, geometry: bool) -> Result<Value, ApiError> {
+        self.get_json(&file_url(key, geometry))
     }
     fn variables_local(&self, key: &str) -> Result<Option<Value>, ApiError> {
         match self.get_json(&format!("/v1/files/{key}/variables/local")) {
@@ -204,7 +227,7 @@ mod tests {
         fn file_meta(&self, _key: &str) -> Result<FileMetaResp, ApiError> {
             unimplemented!("not exercised by this test")
         }
-        fn file(&self, _key: &str) -> Result<Value, ApiError> {
+        fn file(&self, _key: &str, _geometry: bool) -> Result<Value, ApiError> {
             unimplemented!("not exercised by this test")
         }
     }
@@ -215,5 +238,13 @@ mod tests {
             NoVariablesOverride.variables_local("ABC123"),
             Ok(None)
         ));
+    }
+
+    // ---- sticky vector geometry (v0.0.2 spec §4) ----
+
+    #[test]
+    fn file_url_adds_geometry_paths_only_when_requested() {
+        assert_eq!(file_url("ABC123", false), "/v1/files/ABC123");
+        assert_eq!(file_url("ABC123", true), "/v1/files/ABC123?geometry=paths");
     }
 }

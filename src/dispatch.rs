@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 
 use crate::mcp::ToolDef;
 use crate::model::{
-    ComponentRec, ComponentSetRec, FileMeta, NodeRec, ProxyCacheRec, StyleRec,
+    ComponentRec, ComponentSetRec, FileMeta, MirrorConfigRec, NodeRec, ProxyCacheRec, StyleRec,
     VariableCollectionRec, VariableRec,
 };
 use crate::query;
@@ -36,9 +36,10 @@ pub(crate) type NodeReaders<'a, R> = (
 );
 
 /// Read handles for the whole pipeline, in `figmog_pipeline!`'s top-level
-/// order — the exact tuple `st.rtx`'s closure receives. 8 elements: the
+/// order — the exact tuple `st.rtx`'s closure receives. 9 elements: the
 /// `nodes` branch bundle, then `components`, `component_sets`, `styles`,
-/// `variables`, `variable_collections`, `meta`, `proxy_cache`.
+/// `variables`, `variable_collections`, `meta`, `proxy_cache`,
+/// `mirror_config` (v0.0.2 spec §4 — appended last, non-breaking).
 pub(crate) type RootReaders<'a, R> = (
     NodeReaders<'a, R>,
     TableReader<'a, R, String, ComponentRec>,
@@ -48,6 +49,7 @@ pub(crate) type RootReaders<'a, R> = (
     TableReader<'a, R, String, VariableCollectionRec>,
     TableReader<'a, R, u8, FileMeta>,
     TableReader<'a, R, String, ProxyCacheRec>,
+    TableReader<'a, R, u8, MirrorConfigRec>,
 );
 
 // ---- arg extraction ----
@@ -143,6 +145,7 @@ pub(crate) fn dispatch_read_tool<R: Readable>(
         variable_collections,
         meta,
         _cache,
+        _mirror_config,
     ) = r;
 
     match name {
@@ -496,7 +499,11 @@ pub(crate) fn tool_registry() -> Vec<ToolDef> {
         input_schema: json!({
             "type": "object",
             "properties": {
-                "file": {"type": "string", "description": "Figma file URL or key to mirror."}
+                "file": {"type": "string", "description": "Figma file URL or key to mirror."},
+                "geometry": {
+                    "type": "boolean",
+                    "description": "Request vector path data (fillGeometry/strokeGeometry) on this pull. Sticky (spec §4): once set, every later pull of this mirror keeps requesting it until a `pull --fresh`. Omitted preserves whatever this mirror already has stored; default false for a brand-new mirror."
+                }
             },
             "required": ["file"]
         }),

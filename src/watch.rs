@@ -84,7 +84,7 @@ mod tests {
                 .pop()
                 .expect("unexpected extra file_meta call")
         }
-        fn file(&self, _key: &str) -> Result<serde_json::Value, ApiError> {
+        fn file(&self, _key: &str, _geometry: bool) -> Result<serde_json::Value, ApiError> {
             panic!("watcher must never fetch the file itself");
         }
     }

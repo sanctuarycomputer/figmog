@@ -70,6 +70,156 @@ fn pull_from_file_reports_churn_and_is_idempotent() {
     assert_eq!(v["added"], 0);
 }
 
+// ---- sticky vector geometry (v0.0.2 spec §4) ----
+
+/// `pull --geometry` with a fixture that carries `fillGeometry` (what a
+/// real `?geometry=paths` fetch would return on a vector node) keeps that
+/// data in the node's raw JSON — `flatten`'s `raw` field is unknown-field-
+/// preserving, so this is really proving the CLI plumbing (the flag
+/// doesn't get stripped or cause an error) rather than the network
+/// request itself, which `--from-file` never issues (see
+/// `figmog::api::file_url`'s own unit tests for that half).
+#[test]
+fn pull_geometry_flag_keeps_fill_geometry_in_raw() {
+    let dir = tempfile::tempdir().unwrap();
+    let response = dir.path().join("resp.json");
+    std::fs::write(
+        &response,
+        serde_json::to_string(&common::fixture_with_geometry()).unwrap(),
+    )
+    .unwrap();
+    let db = dir.path().join("db").display().to_string();
+
+    Command::cargo_bin("figmog")
+        .unwrap()
+        .args([
+            "pull",
+            "--from-file",
+            response.to_str().unwrap(),
+            "--geometry",
+            "--db",
+            &db,
+        ])
+        .assert()
+        .success();
+
+    let out = Command::cargo_bin("figmog")
+        .unwrap()
+        .args(["get", "1:1", "--db", &db])
+        .assert()
+        .success();
+    let node: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert!(
+        node["fillGeometry"].is_array(),
+        "fillGeometry must survive into raw: {node}"
+    );
+}
+
+/// The stored half of stickiness (spec §4): a `--geometry` pull persists
+/// the flag, and a later *plain* re-pull (no `--geometry`) must not clear
+/// it. The actual network request choice this drives is proven separately
+/// and purely (`store::tests::effective_geometry_is_sticky_once_either_
+/// side_is_true`, `api::tests::file_url_adds_geometry_paths_only_when_
+/// requested`) — `--from-file` never issues a request to inspect, so this
+/// test proves the persisted config survives an ordinary re-pull
+/// end-to-end instead. Reads the stored config directly off the store
+/// (there's no CLI-surfaced way to read `mirror_config`), dropping each
+/// handle before the next `figmog` subprocess reopens the same store —
+/// fjall allows only one open per store per process at a time.
+#[test]
+fn pull_geometry_flag_is_sticky_across_a_later_plain_pull() {
+    let dir = tempfile::tempdir().unwrap();
+    let response = dir.path().join("resp.json");
+    std::fs::write(
+        &response,
+        serde_json::to_string(&common::fixture_v1()).unwrap(),
+    )
+    .unwrap();
+    let db_path = dir.path().join("db");
+    let db = db_path.display().to_string();
+
+    Command::cargo_bin("figmog")
+        .unwrap()
+        .args([
+            "pull",
+            "--from-file",
+            response.to_str().unwrap(),
+            "--geometry",
+            "--db",
+            &db,
+        ])
+        .assert()
+        .success();
+    {
+        let st = figmog::open_store!(&db_path);
+        let stored = st.rtx(|(.., mirror_config)| figmog::store::read_geometry(&mirror_config));
+        assert!(stored, "the --geometry pull must persist the flag");
+    }
+
+    Command::cargo_bin("figmog")
+        .unwrap()
+        .args([
+            "pull",
+            "--from-file",
+            response.to_str().unwrap(),
+            "--db",
+            &db,
+        ])
+        .assert()
+        .success();
+    {
+        let st = figmog::open_store!(&db_path);
+        let still_stored =
+            st.rtx(|(.., mirror_config)| figmog::store::read_geometry(&mirror_config));
+        assert!(still_stored, "a plain re-pull must not turn geometry off");
+    }
+}
+
+/// The documented way back off (spec §4): `--fresh` wipes the store, so a
+/// subsequent plain pull's config starts over at `false`.
+#[test]
+fn pull_fresh_turns_geometry_back_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let response = dir.path().join("resp.json");
+    std::fs::write(
+        &response,
+        serde_json::to_string(&common::fixture_v1()).unwrap(),
+    )
+    .unwrap();
+    let db_path = dir.path().join("db");
+    let db = db_path.display().to_string();
+
+    Command::cargo_bin("figmog")
+        .unwrap()
+        .args([
+            "pull",
+            "--from-file",
+            response.to_str().unwrap(),
+            "--geometry",
+            "--db",
+            &db,
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("figmog")
+        .unwrap()
+        .args([
+            "pull",
+            "--from-file",
+            response.to_str().unwrap(),
+            "--fresh",
+            "--db",
+            &db,
+        ])
+        .assert()
+        .success();
+
+    let st = figmog::open_store!(&db_path);
+    let stored = st.rtx(|(.., mirror_config)| figmog::store::read_geometry(&mirror_config));
+    assert!(!stored, "--fresh must reset the sticky geometry flag");
+}
+
 #[test]
 fn status_pages_tree_get_find() {
     let (_dir, db) = fixture_db();
@@ -600,7 +750,7 @@ fn cli_pull_evicts_stale_cache_rows_on_version_change() {
             &serde_json::json!({"cached": true}),
         )
         .unwrap();
-        let hit = st.rtx(|(_, _, _, _, _, _, _, cache_reader)| {
+        let hit = st.rtx(|(_, _, _, _, _, _, _, cache_reader, _)| {
             cache::lookup(&cache_reader, "get_code", "{}", "100")
         });
         assert!(
@@ -630,7 +780,7 @@ fn cli_pull_evicts_stale_cache_rows_on_version_change() {
         .success();
 
     let st = figmog::open_store!(&db);
-    let evicted = st.rtx(|(_, _, _, _, _, _, _, cache_reader)| {
+    let evicted = st.rtx(|(_, _, _, _, _, _, _, cache_reader, _)| {
         cache::lookup(&cache_reader, "get_code", "{}", "100")
     });
     assert_eq!(

@@ -691,7 +691,9 @@ fn build_sessions(
         if !no_watch {
             let session = &mut manager.sessions[0];
             if !session.mirrored {
-                sessions::do_pull(session, interval).map_err(|(message, _wait)| message)?;
+                // No user-facing geometry flag at startup (spec §4) — the
+                // mirror's stored setting, if any, still drives this.
+                sessions::do_pull(session, interval, false).map_err(|(message, _wait)| message)?;
             }
         }
         // `--db` never resolves a tracked key (pre-v4: `resolve_db`
@@ -722,7 +724,9 @@ fn build_sessions(
         let session = manager.open(f)?;
         let key = session.key.clone();
         let just_pulled = if !no_watch && !session.mirrored {
-            sessions::do_pull(session, interval).map_err(|(message, _wait)| message)?;
+            // No user-facing geometry flag at startup (spec §4) — the
+            // mirror's stored setting, if any, still drives this.
+            sessions::do_pull(session, interval, false).map_err(|(message, _wait)| message)?;
             true
         } else {
             false
@@ -776,7 +780,10 @@ fn watch_tick(
     match session.watcher.tick(&api, &key) {
         Tick::Unchanged => Instant::now() + deadline,
         Tick::Wait { after } => Instant::now() + after,
-        Tick::Changed => match sessions::do_pull(session, interval) {
+        // A background watch tick carries no user-facing geometry flag
+        // (spec §4) — the mirror's stored setting, if any, still drives
+        // this.
+        Tick::Changed => match sessions::do_pull(session, interval, false) {
             Ok(_outcome) => {
                 refresh_current(manager, track_current, &key);
                 Instant::now() + deadline
@@ -829,8 +836,14 @@ fn handle_tool_call(
 
     if name == "figmog_open" {
         let file = dispatch::require_str(args, "file")?;
+        // spec §4: `geometry` turns sticky vector-geometry requests on for
+        // this mirror going forward; omitted preserves whatever's already
+        // stored (default false for a brand-new mirror) — `do_pull`'s
+        // stored-flag union handles that, so `false` here is exactly "no
+        // new override" rather than "force off".
+        let geometry = dispatch::arg_bool(args, "geometry");
         let session = manager.open(&file)?;
-        let outcome = match sessions::do_pull(session, interval) {
+        let outcome = match sessions::do_pull(session, interval, geometry) {
             Ok(outcome) => outcome,
             Err((message, wait)) => {
                 *next_deadline = Instant::now() + wait;
@@ -891,7 +904,10 @@ fn handle_tool_call(
             // `figmog_sync` would otherwise always perform.
             let outcome = match just_pulled {
                 Some(outcome) => outcome,
-                None => match sessions::do_pull(session, interval) {
+                // `figmog_sync` carries no geometry arg of its own (spec
+                // §4) — the mirror's stored setting, if any, still drives
+                // this re-pull.
+                None => match sessions::do_pull(session, interval, false) {
                     Ok(outcome) => outcome,
                     Err((message, wait)) => {
                         *next_deadline = Instant::now() + wait;

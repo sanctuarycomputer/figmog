@@ -21,6 +21,10 @@ pub enum Id {
     /// ONLY: postcard encodes variant indices, so inserting a variant
     /// earlier in this enum would corrupt every existing store.
     ProxyCache(String),
+    /// Sticky per-mirror settings row (v0.0.2 spec §4), one per store, like
+    /// [`Id::Meta`]. APPEND ONLY — see [`Id::ProxyCache`]'s note; this must
+    /// stay the last variant until the next one is appended after it.
+    MirrorConfig,
 }
 
 /// One mirrored record; variant always matches its [`Id`] variant.
@@ -35,6 +39,8 @@ pub enum Rec {
     Meta(FileMeta),
     /// See [`Id::ProxyCache`]. APPEND ONLY — see that variant's note.
     ProxyCache(ProxyCacheRec),
+    /// See [`Id::MirrorConfig`]. APPEND ONLY — see that variant's note.
+    MirrorConfig(MirrorConfigRec),
 }
 
 /// One node of the document tree (children stripped from `raw`).
@@ -148,6 +154,23 @@ pub struct ProxyCacheRec {
     pub content: String,
 }
 
+/// The single sticky-config row (key [`Id::MirrorConfig`], v0.0.2 spec
+/// §4): whether pulls of this mirror should request vector geometry
+/// (`fillGeometry`/`strokeGeometry`) from Figma. An absent row (every
+/// pre-v0.0.2 store, and any store that's never been pulled with
+/// `--geometry`) means `false`.
+///
+/// This lives in its own record kind rather than as a new `FileMeta`
+/// field on purpose: postcard structs encode fields positionally, so
+/// widening `FileMeta` would silently corrupt decoding of every existing
+/// store, while an enum-variant *append* (this type, `Id::MirrorConfig`,
+/// `Rec::MirrorConfig`) is safe — see `CLAUDE.md`'s struct-vs-enum-append
+/// rule and `Id::ProxyCache`'s note.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MirrorConfigRec {
+    pub geometry: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,6 +201,41 @@ mod tests {
         let bytes = postcard::to_allocvec(&rec).unwrap();
         let back: Rec = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(rec, back);
+    }
+
+    #[test]
+    fn mirror_config_rec_postcard_roundtrip() {
+        let rec = Rec::MirrorConfig(MirrorConfigRec { geometry: true });
+        let bytes = postcard::to_allocvec(&rec).unwrap();
+        let back: Rec = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(rec, back);
+    }
+
+    /// Postcard-append safety (v0.0.2 spec §4): a store written before
+    /// `MirrorConfig` existed encoded `Rec::ProxyCache` at variant index 7
+    /// (the 8th of 8 variants, 0-indexed) — postcard's enum encoding is a
+    /// leading varint variant index, one byte for fewer than 128 variants.
+    /// Appending `MirrorConfig` *after* `ProxyCache` must not move that
+    /// index (it would corrupt every existing cache row's discriminant on
+    /// decode), and the new variant must land at the next free index (8).
+    /// A pre-change build isn't available to literally round-trip against,
+    /// so this pins the concrete byte instead — the same guarantee the
+    /// append-only doc comments on `Id`/`Rec` assert, made checkable.
+    #[test]
+    fn append_only_preserves_existing_variant_indices() {
+        let proxy = Rec::ProxyCache(ProxyCacheRec {
+            key_hash: "h".into(),
+            tool: "t".into(),
+            args_canonical: "{}".into(),
+            file_version: "1".into(),
+            content: "{}".into(),
+        });
+        let bytes = postcard::to_allocvec(&proxy).unwrap();
+        assert_eq!(bytes[0], 7, "ProxyCache's variant index must not move");
+
+        let cfg = Rec::MirrorConfig(MirrorConfigRec { geometry: true });
+        let bytes = postcard::to_allocvec(&cfg).unwrap();
+        assert_eq!(bytes[0], 8, "MirrorConfig is the newly appended variant");
     }
 
     #[test]

@@ -11,7 +11,7 @@ use serde_json::Value;
 use crate::api::{ApiError, FigmaApi, UreqApi};
 use crate::flatten::flatten_file;
 use crate::ident::parse_file_ref;
-use crate::store::{Churn, collect_sweepable, collect_variable_ids, sync};
+use crate::store::{self, Churn, collect_sweepable, collect_variable_ids, sync};
 use crate::watch::BACKOFF_CAP;
 
 use super::{CURRENT_FILE, Db, open_store_checked, write_json};
@@ -39,8 +39,9 @@ pub(super) fn cmd_pull(
     file: Option<String>,
     from_file: Option<PathBuf>,
     fresh: bool,
+    geometry: bool,
 ) -> Result<(), String> {
-    let (churn, _name, _version) = do_pull(db, file, from_file, fresh).map_err(|e| {
+    let (churn, _name, _version) = do_pull(db, file, from_file, fresh, geometry).map_err(|e| {
         let message = e.to_string();
         // `pull` is a writer (spec §1: it stays direct-open, never routed
         // over the socket), so a running `figmog serve` holding the same
@@ -64,11 +65,21 @@ pub(super) fn cmd_pull(
 /// The pull mechanics without any printing. `.figmog/current` is written
 /// only once the sync below has actually happened, so a failed pull never
 /// repoints later commands at a nonexistent mirror.
+///
+/// `geometry` is this call's own override (spec §4 stickiness): the
+/// network fetch requests `?geometry=paths` when `geometry` is set *or*
+/// the mirror's already-stored config has it on
+/// (`store::effective_geometry`); the resulting flag is persisted back via
+/// `store::upsert_mirror_config` regardless of path, so it survives to
+/// drive the next pull even for `--from-file` (which never touches the
+/// network, and so never reads this flag for a fetch parameter at all —
+/// see the `from_file` match arm below).
 pub(super) fn do_pull(
     db: &Db,
     file: Option<String>,
     from_file: Option<PathBuf>,
     fresh: bool,
+    geometry: bool,
 ) -> Result<(Churn, String, String), PullError> {
     // `vars_resp` is only ever `Some` on the network path — `--from-file`
     // ingests a saved `GET /v1/files/:key` response and never touches the
@@ -89,8 +100,29 @@ pub(super) fn do_pull(
                 .ok_or_else(|| "no file key: pass a file key or figma.com URL".to_string())?;
             let token = std::env::var("FIGMA_TOKEN")
                 .map_err(|_| "FIGMA_TOKEN not set — required for network pulls".to_string())?;
+            // Peek the mirror's stored geometry setting (spec §4) *before*
+            // fetching, so a plain re-pull of a mirror that was ever
+            // pulled with `--geometry` keeps asking for it. `--fresh`
+            // wipes the store below and never consults it (the documented
+            // way to turn geometry back off), so this never opens a store
+            // that's about to be discarded — and a first-ever pull (no
+            // store on disk yet) never opens one at all, so a token
+            // failure above still leaves no store trace (unchanged from
+            // pre-v0.0.2 — see `failed_pull_does_not_persist_current_or_
+            // create_store`). When a store does exist, this is a second,
+            // short-lived open dropped before the real one further down —
+            // fjall allows only one open handle per store per process at a
+            // time, not one ever; dropping releases its lock.
+            let stored_geometry = if fresh || !db.path.exists() {
+                false
+            } else {
+                open_store_checked(|| crate::open_store!(&db.path))
+                    .map(|st| st.rtx(|(.., mirror_config)| store::read_geometry(&mirror_config)))
+                    .unwrap_or(false)
+            };
+            let request_geometry = store::effective_geometry(geometry, stored_geometry);
             let api = UreqApi::new(token);
-            let resp = api.file(&key)?;
+            let resp = api.file(&key, request_geometry)?;
             // Opportunistic Enterprise variables sync (spec §12): `Ok(None)`
             // on non-Enterprise plans is not an error — v1 behavior
             // (import/inference, sweep-exempt) holds unchanged below.
@@ -113,13 +145,13 @@ pub(super) fn do_pull(
     if let Some(v) = &vars_resp {
         let var_recs = crate::vars::parse_variables_export(v).map_err(|e| e.to_string())?;
         flattened.recs.extend(var_recs);
-        let stored_var_ids = st.rtx(|(_, _, _, _, variables, variable_collections, _, _)| {
+        let stored_var_ids = st.rtx(|(_, _, _, _, variables, variable_collections, _, _, _)| {
             collect_variable_ids(&variables, &variable_collections)
         });
         prior.extend(stored_var_ids);
     }
     let prior_version =
-        st.rtx(|(_, _, _, _, _, _, meta, _)| meta.get(&0).map(|m| m.version.clone()));
+        st.rtx(|(_, _, _, _, _, _, meta, _, _)| meta.get(&0).map(|m| m.version.clone()));
     let churn = sync(&mut st, &prior, &flattened, now_ms());
 
     // Every caller of `do_pull` (`pull` and `figmog call figmog_sync`) goes
@@ -131,13 +163,25 @@ pub(super) fn do_pull(
     // re-opening it here would hit the same single-open-per-process wall
     // `figmog call figmog_sync` used to.
     if prior_version.as_deref() != Some(flattened.file.version.as_str()) {
-        let stale = st.rtx(|(_, _, _, _, _, _, _, cache)| {
+        let stale = st.rtx(|(_, _, _, _, _, _, _, cache, _)| {
             crate::store::stale_cache_ids(&cache, &flattened.file.version)
         });
         if !stale.is_empty() {
             crate::store::evict_stale_cache(&mut st, &stale);
         }
     }
+
+    // Persist the sticky geometry flag (spec §4): this call's own flag OR
+    // whatever's already stored in *this* handle (re-read here rather than
+    // reusing `stored_geometry` above — that value came from a separate,
+    // now-dropped peek on the network path, and doesn't exist at all on
+    // the `--from-file` path, which still must persist stickiness even
+    // though it never requested anything over the network — see this
+    // function's doc comment). `--fresh` already wiped any prior row, so
+    // this store's own current read is `false` there, giving exactly
+    // `geometry` as the persisted value, same as the fetch decision above.
+    let stored_now = st.rtx(|(.., mirror_config)| store::read_geometry(&mirror_config));
+    store::upsert_mirror_config(&mut st, store::effective_geometry(geometry, stored_now));
 
     if let Some(key) = &db.key {
         write_current(key)?;

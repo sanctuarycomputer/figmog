@@ -143,7 +143,7 @@ mod tests {
             );
         });
 
-        let hit = st.rtx(|(_, _, _, _, _, _, _, cache)| {
+        let hit = st.rtx(|(_, _, _, _, _, _, _, cache, _)| {
             lookup(&cache, requested_tool, requested_args, "100")
         });
         assert_eq!(hit, None, "a key-hash collision must never be served");
@@ -170,7 +170,7 @@ mod tests {
             tx.upsert(&Id::ProxyCache(key.clone()), &Rec::ProxyCache(rec));
         });
 
-        let hit = st.rtx(|(_, _, _, _, _, _, _, cache)| lookup(&cache, tool, args, "100"));
+        let hit = st.rtx(|(_, _, _, _, _, _, _, cache, _)| lookup(&cache, tool, args, "100"));
         assert_eq!(hit, Some(Value::String("real data".into())));
     }
 }

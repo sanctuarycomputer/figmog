@@ -49,6 +49,11 @@ enum Cmd {
         /// Wipe the store and rebuild from scratch.
         #[arg(long)]
         fresh: bool,
+        /// Request vector path data (fillGeometry/strokeGeometry) on this
+        /// pull. Sticky (spec §4): once set, every later pull of this
+        /// mirror keeps requesting it until `--fresh`.
+        #[arg(long)]
+        geometry: bool,
     },
     /// MCP stdio server: `figmog_*` tools over the local mirror, with the
     /// sync loop built in (one process owns the store), plus (unless
@@ -364,7 +369,8 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             file,
             from_file,
             fresh,
-        } => pull::cmd_pull(&db, file, from_file, fresh),
+            geometry,
+        } => pull::cmd_pull(&db, file, from_file, fresh, geometry),
         Cmd::ImportVariables { path } => call::cmd_import_variables(&db, path),
         Cmd::Call {
             tool,
@@ -381,7 +387,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             // destructure an unconstrained associated type.
             let st = open_store_checked(|| crate::open_store!(&db.path))?;
             match other {
-                Cmd::Status => st.rtx(|((nodes, _, _, _, _, _, _), _, _, _, _, _, meta, _)| {
+                Cmd::Status => st.rtx(|((nodes, _, _, _, _, _, _), _, _, _, _, _, meta, _, _)| {
                     read::cmd_status(&nodes, &meta)
                 }),
                 Cmd::Pages => st
@@ -485,7 +491,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
                     read::cmd_uses(&nodes, &styled_by, &bound_to, id)
                 }),
                 Cmd::Vars { id } => st.rtx(
-                    |((nodes, ..), _, _, _, variables, variable_collections, _, _)| {
+                    |((nodes, ..), _, _, _, variables, variable_collections, _, _, _)| {
                         read::cmd_vars(&nodes, &variables, &variable_collections, id)
                     },
                 ),
