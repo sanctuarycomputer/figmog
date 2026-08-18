@@ -1,12 +1,11 @@
+<p align="center">
+  <img src="docs/assets/figmog.png" width="100%" alt="figmog">
+</p>
+
 # figmog
 
 figmog is a superset of the Figma MCP surface: a local, instantly-queryable
 mirror of your Figma files built for high-performance design agents.
-
-<p align="center">
-  <img src="docs/assets/figmog.png" width="100%"
-       alt="Figmog is ~17657x faster than Figma's MCP server. Figmog is a local, instantly-queryable mirror of your Figma files. Figmog is built for high-performance design agents.">
-</p>
 
 One node read: 0.055ms from the mirror, 972.6ms through Figma's REST API in
 the same run. That is 17,657x faster. figmog sustained 149 requests a second
