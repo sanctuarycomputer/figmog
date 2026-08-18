@@ -7,7 +7,7 @@
 //! keeps the clap types, top-level dispatch, `run`, and the store-opening/
 //! JSON-writing helpers every submodule shares.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
@@ -17,6 +17,7 @@ use crate::ident::parse_file_ref;
 mod call;
 mod pull;
 mod read;
+mod socket;
 
 pub(crate) use pull::{PullError, now_ms, pull_failure_wait, write_current};
 
@@ -26,6 +27,12 @@ struct Cli {
     /// Store directory (default: .figmog/<file-key>/db).
     #[arg(long, global = true)]
     db: Option<PathBuf>,
+    /// Don't try the running serve's unix-socket control plane (spec §1):
+    /// every read command, `tools`, and `call` always open the store
+    /// directly, exactly like pre-v0.0.2 figmog. On `figmog serve`, don't
+    /// listen on the socket at all.
+    #[arg(long, global = true)]
+    no_socket: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -275,6 +282,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             upstream.clone(),
             *no_upstream,
             figmog_root.clone(),
+            cli.no_socket,
         );
     }
 
@@ -283,12 +291,53 @@ fn dispatch(cli: Cli) -> Result<(), String> {
     // `resolve_db`, exactly like `serve` above: it works with no
     // established `.figmog/current` and no `--db` at all, unlike `figmog
     // call` (below), which does need a resolved mirror to open.
+    //
+    // Socket routing (spec §1) applies here too, before any direct probe:
+    // reachable ⇒ the *running serve's* own merged registry (its own
+    // upstream connection, not this invocation's `--upstream`/
+    // `--no-upstream` — see `socket::try_tools_list`'s doc comment)
+    // answers instead.
     if let Cmd::Tools {
         upstream,
         no_upstream,
     } = &cli.cmd
     {
+        if !cli.no_socket
+            && cli.db.is_none()
+            && let Some(result) = socket::try_tools_list(Path::new(socket::DEFAULT_ROOT))
+        {
+            let tools = result?;
+            return write_json(&socket::tools_rows(&tools));
+        }
         return call::cmd_tools(upstream.clone(), *no_upstream);
+    }
+
+    // Socket routing (spec §1): every read command plus `call` first tries
+    // the running serve's unix-socket control plane for the resolved
+    // figmog-root — reachable ⇒ the command becomes a client of serve
+    // (always-fresh, no lock, and `call figmog_sync` reaches the *owning*
+    // process); unreachable ⇒ falls through to the direct-open path below,
+    // unchanged. Only meaningful when the root is knowable at all: `--db`
+    // bypasses the whole multi-file root concept (an arbitrary store path
+    // has no `<root>/serve.sock` to speak of), so this is skipped whenever
+    // `cli.db` was given, exactly like `--no-socket`.
+    if !cli.no_socket && cli.db.is_none() {
+        let root = Path::new(socket::DEFAULT_ROOT);
+        if let Cmd::Call { tool, args, .. } = &cli.cmd {
+            let parsed_args: Value = match args {
+                Some(raw) => {
+                    serde_json::from_str(raw).map_err(|e| format!("--args: invalid JSON: {e}"))?
+                }
+                None => json!({}),
+            };
+            if let Some(result) = socket::try_call(root, tool, parsed_args) {
+                return write_json(&result?);
+            }
+        } else if let Some((tool, tool_args)) = cmd_as_tool_call(&cli.cmd)
+            && let Some(result) = socket::try_call(root, tool, tool_args)
+        {
+            return write_json(&result?);
+        }
     }
 
     let db = resolve_db(&cli)?;
@@ -465,6 +514,92 @@ fn dispatch(cli: Cli) -> Result<(), String> {
                 }
             }
         }
+    }
+}
+
+/// Maps a read-only [`Cmd`] to the equivalent local `figmog_*` tool name +
+/// arguments `figmog serve` would answer over the socket (spec §1's CLI
+/// routing) — the exact argument shapes [`crate::dispatch::dispatch_read_tool`]
+/// expects, so a socket-routed read produces byte-identical results to the
+/// direct-open path below. `None` for every command socket routing doesn't
+/// apply to: `pull` is a writer (spec §1: "pull stays direct-open");
+/// `serve`/`tools`/`call`/`import-variables` are each handled at their own
+/// call sites (`serve`/`tools` before this is ever reached, `call` by
+/// `dispatch`'s own socket block above `import-variables` is a writer, like
+/// `pull`, and isn't part of spec §1's routed surface at all).
+fn cmd_as_tool_call(cmd: &Cmd) -> Option<(&'static str, Value)> {
+    match cmd {
+        Cmd::Status => Some(("figmog_status", json!({}))),
+        Cmd::Pages => Some(("figmog_pages", json!({}))),
+        Cmd::Tree { id, depth } => Some(("figmog_tree", json!({"id": id, "depth": depth}))),
+        Cmd::Get {
+            id,
+            children,
+            resolve_vars,
+        } => Some((
+            "figmog_node",
+            json!({"id": id, "children": children, "resolve_vars": resolve_vars}),
+        )),
+        Cmd::Dump {
+            id,
+            depth,
+            fields,
+            resolve_vars,
+        } => Some((
+            "figmog_subtree",
+            json!({"id": id, "depth": depth, "fields": fields, "resolve_vars": resolve_vars}),
+        )),
+        Cmd::Find {
+            node_type,
+            page,
+            under,
+        } => Some((
+            "figmog_find",
+            json!({"type": node_type, "page": page, "under": under}),
+        )),
+        Cmd::Search {
+            query,
+            limit,
+            under,
+        } => Some((
+            "figmog_search",
+            json!({"query": query, "limit": limit, "under": under}),
+        )),
+        Cmd::Instances { target } => Some(("figmog_instances", json!({"target": target}))),
+        Cmd::Components => Some(("figmog_components", json!({}))),
+        Cmd::Styles {
+            style_type,
+            values,
+            resolve_vars,
+        } => Some((
+            "figmog_styles",
+            json!({"type": style_type, "values": values, "resolve_vars": resolve_vars}),
+        )),
+        Cmd::Uses { id } => Some(("figmog_uses", json!({"id": id}))),
+        Cmd::Vars { id } => Some(("figmog_vars", json!({"id": id}))),
+        Cmd::Stats => Some(("figmog_stats", json!({}))),
+        Cmd::Path { id } => Some(("figmog_path", json!({"id": id}))),
+        Cmd::Text { page, under } => Some(("figmog_text", json!({"page": page, "under": under}))),
+        Cmd::Where {
+            pointer,
+            equals,
+            page,
+            under,
+        } => Some((
+            "figmog_where",
+            json!({
+                "pointer": pointer,
+                "equals": equals.as_deref().map(read::parse_equals),
+                "page": page,
+                "under": under,
+            }),
+        )),
+        Cmd::At { x, y } => Some(("figmog_at", json!({"x": x, "y": y}))),
+        Cmd::Pull { .. }
+        | Cmd::Serve { .. }
+        | Cmd::Tools { .. }
+        | Cmd::Call { .. }
+        | Cmd::ImportVariables { .. } => None,
     }
 }
 

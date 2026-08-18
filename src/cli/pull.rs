@@ -40,8 +40,24 @@ pub(super) fn cmd_pull(
     from_file: Option<PathBuf>,
     fresh: bool,
 ) -> Result<(), String> {
-    let (churn, _name, _version) =
-        do_pull(db, file, from_file, fresh).map_err(|e| e.to_string())?;
+    let (churn, _name, _version) = do_pull(db, file, from_file, fresh).map_err(|e| {
+        let message = e.to_string();
+        // `pull` is a writer (spec §1: it stays direct-open, never routed
+        // over the socket), so a running `figmog serve` holding the same
+        // store's single-writer lock is the single most common way this
+        // fails while serve is up — point at the one escape hatch that
+        // still works in that situation (`figmog call figmog_sync` reaches
+        // the *owning* process over the socket) rather than leaving the
+        // generic "is figmog serve running?" message to speak for itself.
+        // Scoped to exactly this message (not every `do_pull` failure) so
+        // an unrelated error (bad JSON, a real network failure, ...) isn't
+        // given a hint that doesn't apply to it.
+        if message == super::STORE_LOCKED_MSG {
+            format!("{message} — or ask the running serve: figmog call figmog_sync")
+        } else {
+            message
+        }
+    })?;
     print_churn(&churn)
 }
 

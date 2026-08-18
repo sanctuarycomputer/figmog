@@ -183,8 +183,11 @@ pub(super) fn cmd_vars<R: Readable>(
 // ---- whole-file structural queries ----
 
 /// `--equals <json>`: parse as JSON, falling back to treating the bare word
-/// as a JSON string (so `--equals VERTICAL` works without quoting).
-fn parse_equals(raw: &str) -> Value {
+/// as a JSON string (so `--equals VERTICAL` works without quoting). `pub(super)`
+/// so `super::cmd_as_tool_call` (spec §1's socket routing) can build a
+/// `figmog_where` call's `equals` argument identically to this module's own
+/// `cmd_where`.
+pub(super) fn parse_equals(raw: &str) -> Value {
     serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
 }
 

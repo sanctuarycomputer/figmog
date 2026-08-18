@@ -46,6 +46,15 @@ fn spawn_serve(db: &std::path::Path) -> (ChildGuard, ChildStdin, Receiver<String
 
 /// Like [`spawn_serve`], but with extra CLI args after `--db <db>` (e.g.
 /// `--upstream <url>` for the proxy e2e test).
+///
+/// `current_dir` is pinned to `db`'s own tempdir (every caller's `db` is
+/// `<tempdir>/db` — see `common::fixture_db`): `figmog serve` binds its
+/// unix-socket control plane (spec §1) at `<figmog-root>/serve.sock`, and
+/// `--figmog-root` defaults to the cwd-relative `.figmog` regardless of
+/// `--db` — without this, every one of this file's `--db`-mode e2e tests
+/// (which never sets its own `current_dir`) would default to the *shared*
+/// `cargo test` process cwd, racing every other concurrently-running test
+/// in this binary to bind the exact same socket path.
 fn spawn_serve_with_args(
     db: &std::path::Path,
     extra_args: &[&str],
@@ -54,7 +63,8 @@ fn spawn_serve_with_args(
     let mut cmd = Command::new(bin);
     cmd.args(["serve", "--no-watch", "--db"])
         .arg(db)
-        .args(extra_args);
+        .args(extra_args)
+        .current_dir(db.parent().expect("db path has a parent tempdir"));
     spawn_child(cmd)
 }
 
@@ -1058,4 +1068,294 @@ fn serve_e2e_no_watch_default_root_startup_does_not_write_figmog_current() {
         !cwd.path().join(".figmog").join("current").exists(),
         "--no-watch startup against a pre-built store must not write .figmog/current"
     );
+}
+
+// ---- unix-socket control plane e2e (v0.0.2 spec §1) ----
+//
+// The CLI's own socket routing (`cli::socket`) only ever tries a root
+// derived exactly like `figmog serve`'s default: `.figmog` relative to the
+// current directory (it has no `--figmog-root` override — that's serve's
+// hidden testability knob). Every test below builds a root-derived fixture
+// store at `<cwd>/.figmog/<key>/db` (the same layout a real `figmog pull`
+// would leave) plus `<cwd>/.figmog/current`, then runs both `figmog serve`
+// and every CLI probe with `current_dir(cwd)` so the two sides agree on
+// the root.
+
+/// Build a root-derived fixture store at `<dir>/.figmog/<key>/db` — the
+/// exact path `sessions::open_session` derives for a startup FILE with no
+/// `--figmog-root` override — and establish `<dir>/.figmog/current`
+/// pointing at it (which `pull --from-file --db <path>` itself never
+/// writes, since `--db` short-circuits key tracking — see
+/// `cli::resolve_db`), matching what a real `figmog pull <url>` run from
+/// `dir` would leave behind. Returns the tempdir; the caller must keep it
+/// alive for the test's duration.
+fn default_root_fixture(key: &str, fixture: Value) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let response = dir.path().join("resp.json");
+    std::fs::write(&response, serde_json::to_string(&fixture).unwrap()).unwrap();
+    let figmog_dir = dir.path().join(".figmog");
+    let db = figmog_dir.join(key).join("db");
+    assert_cmd::Command::cargo_bin("figmog")
+        .unwrap()
+        .args(["pull", "--from-file"])
+        .arg(&response)
+        .arg("--db")
+        .arg(&db)
+        .assert()
+        .success();
+    std::fs::write(figmog_dir.join("current"), key).unwrap();
+    dir
+}
+
+/// Spawn `figmog serve --no-watch --no-upstream <key>` against the default
+/// (cwd-relative) `.figmog` root, with `FIGMA_TOKEN` scrubbed — every
+/// socket-plane e2e test below runs the CLI half from the same `cwd`, so
+/// both sides derive the identical root/db paths a real deployment would.
+fn spawn_default_root_serve(
+    cwd: &std::path::Path,
+    key: &str,
+    extra_args: &[&str],
+) -> (ChildGuard, ChildStdin, Receiver<String>) {
+    let bin = assert_cmd::cargo::cargo_bin("figmog");
+    let mut cmd = Command::new(bin);
+    cmd.args(["serve", "--no-watch", "--no-upstream", key])
+        .args(extra_args)
+        .current_dir(cwd)
+        .env_remove("FIGMA_TOKEN");
+    spawn_child(cmd)
+}
+
+/// The `initialize` / `notifications/initialized` handshake every stdio
+/// e2e test in this file performs before its first real request — shared
+/// here since the socket-plane tests below still drive `figmog serve` over
+/// stdio (to prove it's alive and to close it down cleanly) alongside the
+/// socket-routed CLI calls under test.
+fn handshake(stdin: &mut ChildStdin, rx: &Receiver<String>) {
+    send(
+        stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "capabilities": {}},
+        }),
+    );
+    let resp = recv(rx);
+    assert_eq!(resp["id"], json!(1));
+    send(
+        stdin,
+        &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    );
+}
+
+/// (a) `figmog status` while `figmog serve` owns the store: reachable over
+/// the socket ⇒ fresh data, exit 0, no lock error at all (spec §1's
+/// headline fix — this is the exact friction the whole feature exists to
+/// remove).
+#[test]
+fn socket_status_returns_fresh_data_with_no_lock_error() {
+    const KEY: &str = "figmogsocketkeyaaa111";
+    let dir = default_root_fixture(KEY, common::fixture_v1());
+    let (mut guard, mut stdin, rx) = spawn_default_root_serve(dir.path(), KEY, &[]);
+    handshake(&mut stdin, &rx);
+
+    let out = assert_cmd::Command::cargo_bin("figmog")
+        .unwrap()
+        .arg("status")
+        .current_dir(dir.path())
+        .assert()
+        .success();
+    let stdout = out.get_output().stdout.clone();
+    let v: Value = serde_json::from_slice(&stdout)
+        .unwrap_or_else(|e| panic!("stdout not JSON: {e}\n{}", String::from_utf8_lossy(&stdout)));
+    assert!(v.get("error").is_none(), "unexpected error shape: {v}");
+    assert_eq!(v["name"], json!("Fixture"));
+    assert!(
+        v["nodes"].as_u64().unwrap_or(0) > 0,
+        "expected a nonzero node count: {v}"
+    );
+
+    drop(stdin);
+    let status = wait_with_timeout(&mut guard.0, TIMEOUT);
+    assert!(status.success(), "figmog serve exited with {status:?}");
+}
+
+/// (b) `figmog call figmog_sync` reaches the *owning* process over the
+/// socket rather than failing against the local lock. `FIGMA_TOKEN` is
+/// scrubbed from `serve`'s own environment (`spawn_default_root_serve`),
+/// so its pull attempt fails with a specific, recognizable error — proving
+/// the error genuinely came from serve's own sync attempt (not a local
+/// store-lock panic, which this CLI invocation could never hit anyway,
+/// since it never opens the store directly when the socket is reachable)
+/// — and serve must stay alive and answering afterward.
+#[test]
+fn socket_call_figmog_sync_reaches_the_owning_process_not_a_local_lock_error() {
+    const KEY: &str = "figmogsocketkeybbb222";
+    let dir = default_root_fixture(KEY, common::fixture_v1());
+    let (mut guard, mut stdin, rx) = spawn_default_root_serve(dir.path(), KEY, &[]);
+    handshake(&mut stdin, &rx);
+
+    let out = assert_cmd::Command::cargo_bin("figmog")
+        .unwrap()
+        .args(["call", "figmog_sync"])
+        .current_dir(dir.path())
+        .assert()
+        .failure();
+    let output = out.get_output();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "expected a clean exit-1 JSON error, not a lock panic; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let parsed: Value = serde_json::from_slice(&output.stderr).unwrap_or_else(|e| {
+        panic!(
+            "stderr must be exactly one JSON object (parse error: {e}); stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    let err = parsed["error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected an \"error\" string field, got: {parsed}"));
+    assert!(
+        err.contains("FIGMA_TOKEN not set"),
+        "expected serve's own sync error, got: {err}"
+    );
+    assert!(
+        !err.to_lowercase().contains("locked"),
+        "must not be a local store-lock error: {err}"
+    );
+
+    // serve is still alive and answering after that error.
+    let resp = call(&mut stdin, &rx, 2, "figmog_status", json!({}));
+    assert_eq!(resp["result"]["isError"], json!(false), "resp: {resp:#?}");
+
+    drop(stdin);
+    let status = wait_with_timeout(&mut guard.0, TIMEOUT);
+    assert!(status.success(), "figmog serve exited with {status:?}");
+}
+
+/// (c) `--no-socket` forces the old direct-open path even with a reachable
+/// serve — reproducing the pre-v0.0.2 lock error exactly, on both the
+/// `serve` side (never listens) and the CLI side (never probes).
+#[test]
+fn no_socket_flag_forces_the_old_lock_error() {
+    const KEY: &str = "figmogsocketkeyccc333";
+    let dir = default_root_fixture(KEY, common::fixture_v1());
+    let (mut guard, mut stdin, rx) = spawn_default_root_serve(dir.path(), KEY, &[]);
+    handshake(&mut stdin, &rx);
+
+    let out = assert_cmd::Command::cargo_bin("figmog")
+        .unwrap()
+        .args(["status", "--no-socket"])
+        .current_dir(dir.path())
+        .assert()
+        .failure();
+    let output = out.get_output();
+    assert_eq!(output.status.code(), Some(1));
+    let parsed: Value = serde_json::from_slice(&output.stderr).unwrap();
+    let err = parsed["error"].as_str().unwrap();
+    assert!(
+        err.contains("store is locked"),
+        "expected the direct-mode lock error, got: {err}"
+    );
+
+    drop(stdin);
+    let status = wait_with_timeout(&mut guard.0, TIMEOUT);
+    assert!(status.success(), "figmog serve exited with {status:?}");
+}
+
+/// (d) A clean stdin-EOF exit removes `serve.sock` — the socket file must
+/// not outlive the process that created it.
+#[test]
+fn clean_exit_removes_serve_sock() {
+    const KEY: &str = "figmogsocketkeyddd444";
+    let dir = default_root_fixture(KEY, common::fixture_v1());
+    let (mut guard, mut stdin, rx) = spawn_default_root_serve(dir.path(), KEY, &[]);
+    handshake(&mut stdin, &rx);
+
+    let sock_path = dir.path().join(".figmog").join("serve.sock");
+    assert!(
+        sock_path.exists(),
+        "socket file should exist while serve is running"
+    );
+
+    drop(stdin);
+    let status = wait_with_timeout(&mut guard.0, TIMEOUT);
+    assert!(status.success(), "figmog serve exited with {status:?}");
+
+    assert!(
+        !sock_path.exists(),
+        "socket file should be removed on clean exit"
+    );
+}
+
+/// (e) A second `figmog serve` against the same root, while the first is
+/// still alive, exits with the clean JSON "another figmog serve owns this
+/// root" error — never stealing the socket. Started with zero startup
+/// files so its own session-store open (a separate concern, spec §1's I-1)
+/// can never race the socket check and mask it with a store-lock error
+/// instead.
+#[test]
+fn second_serve_on_same_root_exits_with_clean_error() {
+    const KEY: &str = "figmogsocketkeyeee555";
+    let dir = default_root_fixture(KEY, common::fixture_v1());
+    let (mut guard, mut stdin, rx) = spawn_default_root_serve(dir.path(), KEY, &[]);
+    handshake(&mut stdin, &rx);
+
+    let out = assert_cmd::Command::cargo_bin("figmog")
+        .unwrap()
+        .args(["serve", "--no-watch", "--no-upstream"])
+        .current_dir(dir.path())
+        .env_remove("FIGMA_TOKEN")
+        .assert()
+        .failure();
+    let output = out.get_output();
+    assert_eq!(output.status.code(), Some(1));
+    let parsed: Value = serde_json::from_slice(&output.stderr).unwrap_or_else(|e| {
+        panic!(
+            "stderr must be exactly one JSON object (parse error: {e}); stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    let err = parsed["error"].as_str().unwrap();
+    assert!(
+        err.contains("another figmog serve owns this root"),
+        "expected the clean multi-owner error, got: {err}"
+    );
+
+    // The first serve is untouched by the second's failed startup.
+    let resp = call(&mut stdin, &rx, 2, "figmog_status", json!({}));
+    assert_eq!(resp["result"]["isError"], json!(false), "resp: {resp:#?}");
+
+    drop(stdin);
+    let status = wait_with_timeout(&mut guard.0, TIMEOUT);
+    assert!(status.success(), "figmog serve exited with {status:?}");
+}
+
+/// (f) A stale socket file (nothing listening behind it — the simplest
+/// reproduction of a leftover from an unclean exit) is unlinked and
+/// rebound at startup, proven by a real client successfully connecting to
+/// the *new* socket afterward.
+#[test]
+fn stale_socket_file_is_unlinked_and_rebound() {
+    let dir = tempfile::tempdir().unwrap();
+    let figmog_dir = dir.path().join(".figmog");
+    std::fs::create_dir_all(&figmog_dir).unwrap();
+    let sock_path = figmog_dir.join("serve.sock");
+    std::fs::write(&sock_path, b"not a socket, nothing listening here").unwrap();
+
+    let (mut guard, mut stdin, rx) =
+        spawn_default_root_serve(dir.path(), "figmogstalekeyfff666", &[]);
+    handshake(&mut stdin, &rx);
+
+    assert!(sock_path.exists(), "a real socket should now be bound");
+    assert!(
+        std::os::unix::net::UnixStream::connect(&sock_path).is_ok(),
+        "the rebound socket should accept a real connection"
+    );
+
+    drop(stdin);
+    let status = wait_with_timeout(&mut guard.0, TIMEOUT);
+    assert!(status.success(), "figmog serve exited with {status:?}");
 }
