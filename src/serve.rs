@@ -33,7 +33,7 @@
 //!
 //! **v3 (build design §12):** unless `--no-upstream`, figmog also probes
 //! Figma's native desktop MCP server at startup and becomes the *only*
-//! Figma MCP an agent needs — `tools/list` merges the 20 local `figmog_*`
+//! Figma MCP an agent needs — `tools/list` merges the 21 local `figmog_*`
 //! tools with every upstream tool verbatim (`proxy::merge_registry`), and
 //! `tools/call` routes by the namespace rule (`proxy::is_local_tool`).
 //! Upstream routing is global, not per-session: the desktop server serves

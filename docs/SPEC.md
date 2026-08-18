@@ -17,7 +17,12 @@ queries — answers from local storage in milliseconds, at zero Figma API
 cost. `figmog serve` runs the same engine as a long-lived MCP stdio
 server with its own poll loop, plus a cached proxy to Figma's native
 desktop Dev Mode MCP server, so it can be the *only* Figma MCP an agent
-needs to connect.
+needs to connect. `serve` additionally listens on a unix-socket control
+plane (§6a), so CLI reads answer from the running server instead of
+failing on the store lock it holds.
+
+Two commands spend Figma's API budget deliberately and explicitly: `pull`
+(and the pull paths `serve` drives) and `figmog images` (§15).
 
 ## 2. Architecture
 
@@ -38,7 +43,7 @@ needs to connect.
                          │  store.rs                │  figmog_pipeline! (fold)
                          │  sync() — upsert + sweep │  KeyedStream<Id, Rec, _>
                          └────────────┬─────────────┘
-                                      │ 8 materialized sinks (frozen names)
+                                      │ 16 materialized sinks (frozen names)
                                       ▼
                          ┌─────────────────────────┐
                          │  query.rs                 │  one source of truth for
@@ -49,10 +54,10 @@ needs to connect.
                     ▼                                    ▼
          ┌─────────────────────┐              ┌─────────────────────────┐
          │  cli/ (read.rs)      │              │  dispatch.rs              │
-         │  pretty-JSON on      │              │  dispatch_read_tool +      │
-         │  stdout               │              │  tool_registry (19 tools)  │
-         └─────────────────────┘              └────────────┬────────────┘
-                                                              │
+         │  pretty-JSON stdout, │              │  dispatch_read_tool +      │
+         │  or a socket client  │              │  tool_registry (21 tools)  │
+         │  of serve (§6a)      │              └────────────┬────────────┘
+         └─────────────────────┘                           │
                                                               ▼
                                               ┌─────────────────────────┐
                                               │  serve.rs / sessions.rs   │
@@ -82,12 +87,18 @@ matching [`Rec`](../src/model.rs) variant:
 | `VariableCollection(String)` | `VariableCollectionRec` | same as above |
 | `Meta` | `FileMeta` | one row: name, version, last_modified, synced_at_unix_ms |
 | `ProxyCache(String)` | `ProxyCacheRec` | cached proxied-tool responses (§8) |
+| `MirrorConfig` | `MirrorConfigRec` | one row: this mirror's sticky pull settings (§14) |
+| `ImageBlob(String)` | `ImageBlobRec` | cached render and fill bytes (§15) |
 
 `Id`/`Rec` are **append-only enums** — postcard encodes variant indices
 positionally, so inserting a new variant anywhere but the end would
-silently corrupt every existing on-disk store. `ProxyCache` is the most
-recent addition and sits last in both enums; the next new record kind
-goes after it, never between existing variants.
+silently corrupt every existing on-disk store. `ImageBlob` is the most
+recent addition and sits last in both enums (`MirrorConfig` immediately
+before it); the next new record kind goes after `ImageBlob`, never
+between existing variants. The same rule is why a new setting arrives as
+a new record kind rather than a new field on an existing `Rec` struct:
+struct fields are positional too, so widening `FileMeta` would break
+every store already on disk, while appending `MirrorConfig` does not.
 
 `NodeRec` is the workhorse record: id, parent/child-index, page id
 (nearest CANVAS ancestor), type, name, visibility, TEXT `characters`,
@@ -105,6 +116,18 @@ upstream result). A hit requires `tool`/`args_canonical` to match the
 collidable, and tool arguments are agent-authored strings, so the key
 hash alone is not trusted (see `cache::lookup`).
 
+`MirrorConfigRec` (§14): `geometry: bool`, one row per mirror. An absent
+row means `false`, which is what every store written before this record
+kind existed reports.
+
+`ImageBlobRec` (§15): `key_hash` (= the `Id::ImageBlob` key), `kind`
+(`"render"` or `"fill"`), `subject` (node id for a render, `imageRef`
+hash for a fill), `format`, `scale_milli` (requested scale × 1000, always
+`1000` for fills), `file_version`, and `bytes`. A hit checks
+`kind`/`subject`/`format`/`scale_milli` against the request rather than
+trusting the key hash, the same identity check `cache::lookup` makes for
+proxied responses.
+
 **Determinism contract:** every map-shaped field is a sorted `Vec` of
 pairs; every canonical-JSON string comes from `serde_json` without
 `preserve_order` (`serde_json::Value` is `BTreeMap`-backed here, so
@@ -115,7 +138,7 @@ detector. No `HashMap` iteration ever reaches an output boundary.
 
 ## 4. Pipeline and sinks
 
-`store::figmog_pipeline!()` wires the flattened records into 14
+`store::figmog_pipeline!()` wires the flattened records into 16
 `fold` terminal sinks, keyed off `store.rs`'s pure branch functions
 (`node_only`, `child_edge`, `text_doc`, `instance_edge`, `style_edges`,
 `variable_edges`, `type_edge`, plus one `rec_branch!`-generated filter per
@@ -138,6 +161,13 @@ is a breaking store-format change:
 | `variable_collections` | Table | collection id | `vars` |
 | `meta` | Table | `0u8` (not `()` — postcard-encodes to zero bytes, and the store forbids empty keys) | `status`, version comparisons |
 | `proxy_cache` | Table | cache key hash | proxied-tool caching (§8) |
+| `mirror_config` | Table | `0u8` (one row, like `meta`) | sticky pull settings (§14) |
+| `images` | Table | image cache key hash | render/fill byte caching (§15) |
+
+`mirror_config` and `images` are appended at the pipeline root's tail, so
+the reader tuple grows at the end and older stores keep decoding. Both
+sit outside `collect_sweepable` (§5): a file sync never removes a config
+row, and image rows are evicted by version instead.
 
 `bound_to`'s edges are deliberately not deduped before feeding the
 inverted index: `InvertedIndex` is set-semantic, so duplicate `(node,
@@ -167,13 +197,14 @@ whole pipeline — `unchanged` increments, no index writes happen. A
 spurious watch trigger or a repeated `pull` therefore costs exactly one
 Tier-1 fetch and nothing else downstream.
 
-**Proxy-cache eviction** is a separate pass, not folded into `sync`'s
-sweep (its churn accounting stays untouched by this feature): after a
-sync whose file *version* actually moved, every `proxy_cache` row tagged
-with the old version is identified (`store::stale_cache_ids`) and removed
-(`store::evict_stale_cache`). This runs after every `pull`/`figmog_sync`/
-watch-tick pull that changes the version, and is bundled into `pull
---fresh`'s whole-store wipe too.
+**Version-keyed cache eviction** is a separate pass, not folded into
+`sync`'s sweep (its churn accounting stays untouched by this feature):
+after a sync whose file *version* actually moved, every `proxy_cache` row
+(`store::stale_cache_ids`) and every `images` row
+(`store::stale_image_ids`) tagged with the old version is removed through
+the one `store::evict_stale_cache` function. This runs after every
+`pull`/`figmog_sync`/watch-tick pull that changes the version, and is
+bundled into `pull --fresh`'s whole-store wipe too.
 
 ## 6. `figmog serve`: multi-file sessions, watch, MCP
 
@@ -228,18 +259,25 @@ to the default (see "Startup" above). There is no idle-session eviction
 and no cross-file queries — once opened, a session stays open for the
 process's life.
 
-**The 19 `figmog_*` tools** (`dispatch::tool_registry`): 12 core reads
+**The 21 `figmog_*` tools** (`dispatch::tool_registry`): 13 core reads
 (`figmog_status`, `figmog_pages`, `figmog_tree`, `figmog_node`,
-`figmog_find`, `figmog_search`, `figmog_instances`, `figmog_components`,
-`figmog_styles`, `figmog_uses`, `figmog_vars`, `figmog_sync`) + 5
-whole-file structural queries (`figmog_stats`, `figmog_path`,
-`figmog_text`, `figmog_where`, `figmog_at`) + 2 multi-file management
-tools that aren't per-file (`figmog_open`, `figmog_files`). Every tool but
-`figmog_sync`/`figmog_open` reads the local mirror at zero Figma API
-cost; `figmog_sync` forces one pull and is the only local tool that
-spends Figma's rate budget. `figmog_status`'s result also carries
+`figmog_subtree`, `figmog_find`, `figmog_search`, `figmog_instances`,
+`figmog_components`, `figmog_styles`, `figmog_uses`, `figmog_vars`,
+`figmog_sync`) + 5 whole-file structural queries (`figmog_stats`,
+`figmog_path`, `figmog_text`, `figmog_where`, `figmog_at`) +
+`figmog_images` (§15) + 2 multi-file management tools that aren't
+per-file (`figmog_open`, `figmog_files`). Every tool but
+`figmog_sync`/`figmog_open`/`figmog_images` reads the local mirror at
+zero Figma API cost; `figmog_sync` forces one pull, `figmog_open` pulls a
+newly referenced file, and `figmog_images` fetches renders and fills, so
+those three are the local tools that spend Figma's rate budget.
+`figmog_status`'s result also carries
 `upstream: "connected" | "unreachable" | "disabled"`, spliced in at the
 call site that knows it (never inside `query::status` itself).
+`figmog_open` also takes an optional `geometry` boolean (§14).
+
+The 19 per-file tools each carry the optional `file` property described
+above; `figmog_open` and `figmog_files` don't.
 
 **Protocol (`mcp.rs`):** pure JSON-RPC 2.0 over stdio frames, no store,
 no I/O. `initialize` echoes the client's `protocolVersion` (or
@@ -251,6 +289,32 @@ results are wrapped as a single text content block
 (`ToolOutput::Raw`) since they're already a complete, correctly-shaped
 MCP `CallToolResult` (re-wrapping would double-encode a non-text content
 type like `get_screenshot`'s image block).
+
+## 6a. The unix-socket control plane
+
+`figmog serve` binds `<figmog-root>/serve.sock` (mode 0600, inside a root
+tightened to 0700) before it opens any session store, and unlinks it on
+exit through a guard held for `run_serve`'s whole scope. A pre-existing
+socket file is probed with a connect first (`serve::classify_probe`):
+connect succeeds ⇒ another `serve` owns this root, and this process exits
+with the standard `{"error": ...}` JSON; any connect failure ⇒ the file
+is stale, so it is unlinked and rebound. `--no-socket` skips binding.
+
+Frames on the socket are the same newline-delimited JSON-RPC the stdio
+loop reads. `initialize` is optional for socket clients: `tools/call` is
+accepted directly, since `mcp::handle_message` treats every frame
+independently. An acceptor thread gives each connection its own reader
+thread, which tags frames with a connection id and forwards them into the
+same `mpsc` channel stdin feeds; the connection's write half is
+registered before its reader starts, so a response always has somewhere
+to route. Responses are written to the owning connection under a write
+timeout, so a client that stops reading is disconnected and dropped from
+the registry rather than stalling the single-threaded loop; a vanished
+client is a silent no-op. The store stays single-threaded throughout:
+socket traffic interleaves with MCP frames and watch ticks like any other
+request.
+
+The CLI side of the plane is in §10.
 
 ## 7. Style values: derived, not authoritative
 
@@ -268,7 +332,7 @@ tools`/`figmog call`, §10) probes Figma's native desktop app's Dev Mode
 MCP server (`http://127.0.0.1:3845/mcp` by default, streamable HTTP) at
 startup. This requires a **paid Dev/Full seat** and the desktop app
 running with Dev Mode MCP enabled. On success, `tools/list` merges
-figmog's 19 local tools with every upstream tool verbatim (description
+figmog's 21 local tools with every upstream tool verbatim (description
 prefixed `"[via Figma desktop] "`); on failure, one stderr line and
 local-only tools for the rest of the process — **no mid-session
 re-probe**, so a server that starts before the desktop app is reachable
@@ -359,21 +423,47 @@ or a broken-pipe message.
 The CLI is split by concern: `src/cli/mod.rs` (clap types, top-level
 dispatch, `run`, the shared store-opening/JSON-writing helpers),
 `src/cli/pull.rs` (`pull`, the typed `PullError`, `.figmog/current`),
-`src/cli/read.rs` (the 16 read-only query commands), `src/cli/call.rs`
+`src/cli/read.rs` (the 17 read-only query commands), `src/cli/call.rs`
 (`tools`, `call`, `import-variables` — the cached-proxy CLI parity
 surface, so every tool `figmog serve` would expose is reachable without
-an MCP client).
+an MCP client), `src/cli/images.rs` (`images`, §15), and
+`src/cli/socket.rs` (the client half of the control plane, §6a).
 
 `figmog tools` never opens the store (it only needs an optional upstream
 probe), so unlike every other command it does **not** require a resolved
 mirror — no established `.figmog/current` and no `--db` needed. `figmog
 call` does need one, since local tool dispatch reads the store.
 
+**Socket-first routing (§6a).** When neither `--no-socket` nor `--db` is
+given, every read command, plus `tools`, `call` and `images`, first tries
+`<.figmog>/serve.sock`. Reachable ⇒ the command becomes a client of the
+running `serve`: `cli::cmd_as_tool_call` maps the subcommand to the tool
+name and argument object `dispatch::dispatch_read_tool` expects, so the
+JSON on stdout is byte-identical to the direct-open answer, and a
+serve-side failure surfaces as the standard `{"error": ...}` exit 1.
+Unreachable ⇒ the store is opened directly. `--db` bypasses the socket
+entirely, since it names a store rather than a root. Null-valued optional
+arguments are stripped from a mapped command's arguments, so an omitted
+flag stays omitted rather than arriving as an explicit `null` (`figmog
+call`'s own `--args` payload is passed through untouched). A routed
+command also carries the mirror `.figmog/current` resolves to as its
+`file` argument, so it answers for the same file the direct path would;
+`figmog call figmog_open` is the exception, since there `file` names the
+file to open rather than a routing target. A routed `figmog_status`
+result drops the `upstream` field serve splices in, keeping the CLI's
+output byte-identical on both paths.
+
+`pull` is a writer and always opens the store directly. While `serve`
+holds that store, `pull`'s lock error additionally says "or ask the
+running serve: figmog call figmog_sync", which reaches the process that
+owns it.
+
 **Single-writer constraint:** fjall allows only one open handle per
-store. `figmog serve` holds its `--db`'s lock for its whole life; any CLI
-command that tries to open the same store while `serve` runs gets a
-clean `store is locked — is figmog serve running? ...` error (exit 1),
-never fold's raw lock panic (exit 101) — see `open_store_checked`.
+store. `figmog serve` holds its `--db`'s lock for its whole life; a CLI
+command that opens the same store directly (`--no-socket`, an explicit
+`--db`, or `pull`) while `serve` runs gets a clean `store is locked — is
+figmog serve running? ...` error (exit 1), never fold's raw lock panic
+(exit 101) — see `open_store_checked`.
 
 ## 11. Determinism and schema-stability contracts
 
@@ -387,8 +477,131 @@ never fold's raw lock panic (exit 101) — see `open_store_checked`.
 - `Id`/`Rec` are append-only postcard enums (§3) — a store built by an
   older figmog binary must still open cleanly with a newer one, as long
   as no variant was reordered or removed.
+- `Rec` payload structs are positional too, so new stored state arrives
+  as a new record kind rather than a new field on an existing struct
+  (§3, §14).
 - Sink names (§4) are frozen on-disk schema; renaming one changes what
-  store directory an unmodified binary can open.
+  store directory an unmodified binary can open. New sinks are appended
+  at the pipeline root's tail, so reader tuples grow at the end.
 - `fold`/`bogkit` is upstream: never vendored, never patched — figmog
   consumes only the pinned git dependency's public API (see the crate's
   `CLAUDE.md`).
+
+## 12. Node addressing
+
+`ident::parse_node_ref(input) -> Option<(Option<file_key>, node_id)>` is
+the one place a node-id argument is parsed. A bare id passes through with
+`normalize_node_id`'s `0-1` ⇒ `0:1` rule and nothing else. A figma.com
+URL carrying `node-id=` anywhere in its query yields that id
+(percent-decoded, normalized) plus the URL's file key when the URL names
+one; a figma.com URL with no `node-id=` yields `None` rather than being
+treated as an id. `ident::normalize_node_ref` is the "just give me the
+id" wrapper the query layer calls, falling back to the raw input.
+
+Every node-id-shaped argument accepts both forms: the CLI's `id`,
+`target`, `--under` and `--page` arguments, and the tools' `id`, `under`,
+`target` and `page` properties. In `serve`, when a tool call omits `file`
+and one of `id`/`under`/`target` is a URL that names a file,
+`dispatch::infer_file_from_node_ref` routes the call at that file and
+auto-opens it. An explicit `file` always wins; a disagreement between the
+two is named in the error text if the node isn't found, comparing
+normalized keys so two spellings of the same file don't false-positive.
+
+## 13. Subtree dump, subtree scoping, resolved variables
+
+**Subtree dump** (`query::subtree`; `figmog dump <id>`,
+`figmog_subtree`): the node's full `raw` JSON with `children` nested
+recursively in child-index order, to `depth` levels (unlimited when
+omitted). `fields` projects every node to the named raw fields; `id`,
+`name` and `type` survive projection by an explicit keep-list, and
+`children` plus `resolved_variables` are inserted after projection runs,
+so they survive too. An unknown field name is simply absent. Response
+size is the caller's business: the tool description says so and points at
+`depth`/`fields`.
+
+**Subtree scoping** (`query::resolve_under` + `query::scope_ids`;
+`--under <id>` on `text`/`find`/`search`/`where` and the matching tool
+argument): one BFS over the `children` index from the scope root
+(inclusive, cycle-safe via a visited set) collects the descendant id set,
+and results are filtered against it. It composes with `page` by
+intersection. An unknown scope id gives the standard `no node ...` error.
+`search` ranks the whole corpus before truncating when a scope is active,
+so an in-scope hit can't be lost to an out-of-scope one taking its slot
+in the top-N.
+
+**Resolved variables** (`query::resolved_variables`; `--resolve-vars` on
+`get`, `dump` and `styles --values`, plus the matching tool arguments): a
+read-time join that emits a `resolved_variables` array alongside the raw
+data, never mutating it. Each entry is `{pointer, variable_id,
+variable_name, values_by_mode}` when the variables table has that id
+(mode ids mapped to mode names through the collection), or `{pointer,
+variable_id, source: "unresolved"}` when it doesn't. The flag never
+errors; it resolves what it can. On `styles --values`, the annotation
+covers bindings whose pointer falls under that style type's raw-JSON
+prefix (FILL ⇒ `/fills`, and so on).
+
+## 14. Vector geometry and mirror config
+
+`pull --geometry` adds `?geometry=paths` to the Tier-1 file fetch
+(`api::file_url`), so vector nodes carry `fillGeometry` and
+`strokeGeometry` in their `raw`.
+
+The flag is stored per mirror as the single `Rec::MirrorConfig` row (§3,
+§4) rather than as a new field on `FileMeta`, because postcard struct
+fields are positional: widening an existing `Rec` struct breaks every
+store already on disk, while appending an enum variant does not.
+
+`store::effective_geometry(flag, stored)` is `flag || stored`, so every
+later pull of that mirror keeps requesting geometry: the watch tick,
+`figmog_sync`, `figmog_open` and an auto-open inside `resolve` all read
+the stored flag first, and the records never churn from flag drift. The
+way back off is `pull --fresh`, whose callers pass `stored = false`
+without reading the store they are about to wipe. `figmog_open` takes an
+optional `geometry` argument; omitting it preserves whatever the mirror
+already has. The config row is written in its own write transaction,
+outside `sync`'s, and is never swept.
+
+## 15. Images
+
+`figmog images <node-id>... [--format png|svg] [--scale N] [--out <dir>]`
+and the `figmog_images { ids, format?, scale?, file? }` tool fetch image
+bytes. Nothing in figmog calls them on its own: the images endpoints are
+Figma's most rate-limited, so a fetch happens only when a person or an
+agent asks for one.
+
+**Two fetch kinds behind one command.** Renders come from `GET
+/v1/images/:key?ids=…&format=…&scale=…`, which returns per-node URLs that
+are then downloaded. Fills come from the `fills` of the requested nodes:
+every `imageRef` hash found there is resolved through `GET
+/v1/files/:key/images` (fetched at most once per invocation) and
+downloaded. One invocation makes at most one call of each kind.
+
+**Cache.** Bytes land in `images` as `Rec::ImageBlob` rows keyed by a
+hash of kind, subject, format and scale (§3). A hit requires the stored
+row's identity fields to match the request and its `file_version` to
+equal the mirror's current version, so a repeat request against an
+unedited file spends nothing. Rows tagged with an older version are
+evicted by the same version-change pass that evicts `proxy_cache` (§5).
+
+**Output.** The CLI writes each item into `--out` (default
+`./figmog-images/`) and prints a manifest of
+`[{id|ref, kind, format, bytes, cached, path?, error?}]`, where `bytes`
+is a count. Exit is 0 when at least one item was written, 1 otherwise,
+and the manifest is the stdout payload either way. The MCP tool returns
+the same manifest plus, per item within the 1 MiB inline cap: an `image`
+content block (base64) for raster formats, or a `text` block carrying the
+raw markup for `format=svg`. SVG ships as text because agents consume the
+markup directly and clients render `image/svg+xml` blocks inconsistently.
+The cap is measured on the *encoded* length, since base64 inflates raw
+bytes by about a third; an item over the cap becomes a text entry naming
+the `figmog images --out` command that downloads it.
+
+**Rate limits.** A 429 is recorded per item in the manifest (an `error`
+field carrying the Retry-After) and the rest of the results still come
+back: exit 0 if at least one item succeeded, else 1.
+
+**Routing.** `figmog images` both spends API budget and writes cache
+rows, so unlike a read command it cannot open a store `serve` holds. With
+the socket reachable it routes through serve's own `figmog_images` tool
+(serve owns the caching); with `--no-socket` or no server listening it
+fetches and writes directly, like `pull`.
