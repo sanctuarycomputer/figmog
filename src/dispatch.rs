@@ -1,4 +1,4 @@
-//! The 16 read-only `figmog_*` tools: one dispatch function, generic over
+//! The 17 read-only `figmog_*` tools: one dispatch function, generic over
 //! the store's reader types, shared by `figmog serve`'s request loop and
 //! the CLI's `figmog call`/`figmog tools`. (`figmog_sync` is not here — it
 //! writes to the store and drives watch/backoff state that only exists at

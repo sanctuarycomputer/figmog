@@ -322,6 +322,64 @@ fn parent_cycle_does_not_hang_path_or_stats() {
         .success();
 }
 
+/// The same hand-upserted 2-node mutual-parent construction as
+/// `parent_cycle_does_not_hang_path_or_stats` above also derives a
+/// `children`-multimap cycle (`store::child_edge` feeds `children` off
+/// each node's own `parent_id`, so A:1's parent B:1 and B:1's parent A:1
+/// produce mutual `children` edges too) — `--under`'s BFS
+/// (`query::scope_ids`) must not hang on it, same "runs inside `figmog
+/// serve`'s single-threaded loop" stakes as the parent-cycle case.
+#[test]
+fn children_cycle_does_not_hang_under_scoping() {
+    use figmog::model::{Id, NodeRec, Rec};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db");
+    let mut st = figmog::open_store!(&db);
+    let node = |id: &str, parent: &str| NodeRec {
+        id: id.into(),
+        parent_id: Some(parent.into()),
+        child_index: 0,
+        page_id: "0:1".into(),
+        node_type: "FRAME".into(),
+        name: id.into(),
+        visible: true,
+        text: None,
+        component_id: None,
+        component_properties: vec![],
+        property_definitions: None,
+        style_refs: vec![],
+        bound_variables: vec![],
+        abs_bounds: None,
+        raw: "{}".into(),
+    };
+    st.wtx(|tx| {
+        tx.upsert(&Id::Node("A:1".into()), &Rec::Node(node("A:1", "B:1")));
+        tx.upsert(&Id::Node("B:1".into()), &Rec::Node(node("B:1", "A:1")));
+    });
+    drop(st); // release the store lock before the child process opens it
+
+    let db = db.display().to_string();
+
+    let out = Command::cargo_bin("figmog")
+        .unwrap()
+        .args(["find", "--type", "FRAME", "--under", "A:1", "--db", &db])
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let ids: Vec<&str> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["A:1", "B:1"],
+        "BFS terminates and still finds both cyclic nodes"
+    );
+}
+
 #[test]
 fn import_variables_upgrades_vars_to_authoritative() {
     let (dir, db) = fixture_db();
@@ -831,6 +889,97 @@ fn under_unknown_id_errors_cleanly() {
     assert!(stderr.contains("99:99"), "stderr: {stderr}");
 }
 
+/// Review fix I1: `search --under` must rank the *entire* matching corpus
+/// before truncating to `limit`, not truncate to the global top-`limit`
+/// and filter afterward — otherwise a tight limit under a scope that
+/// contains a real (if globally lower-ranked) match silently returns
+/// nothing. Fixture: five short out-of-scope TEXT nodes named exactly
+/// "garden" (BM25 favors them — an exact, single-term document scores
+/// higher than a longer one containing the term once) rank above the one
+/// in-scope node whose text merely *contains* "garden" among other words.
+#[test]
+fn search_under_ranks_the_full_corpus_before_truncating_to_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let response = dir.path().join("resp.json");
+    let fixture = serde_json::json!({
+        "name": "SearchUnderFixture",
+        "version": "1",
+        "lastModified": "2026-08-17T00:00:00Z",
+        "document": {
+            "id": "0:0", "name": "Document", "type": "DOCUMENT",
+            "children": [
+                { "id": "0:1", "name": "Page 1", "type": "CANVAS", "children": [
+                    { "id": "1:1", "name": "Scope", "type": "FRAME", "children": [
+                        { "id": "1:2", "name": "Info", "type": "TEXT",
+                          "characters": "A lovely garden path unfolds among tall trees",
+                          "children": [] }
+                    ] }
+                ] },
+                { "id": "0:2", "name": "Page 2", "type": "CANVAS", "children": [
+                    { "id": "2:1", "name": "garden", "type": "TEXT", "children": [] },
+                    { "id": "2:2", "name": "garden", "type": "TEXT", "children": [] },
+                    { "id": "2:3", "name": "garden", "type": "TEXT", "children": [] },
+                    { "id": "2:4", "name": "garden", "type": "TEXT", "children": [] },
+                    { "id": "2:5", "name": "garden", "type": "TEXT", "children": [] }
+                ] }
+            ]
+        },
+        "components": {}, "componentSets": {}, "styles": {}
+    });
+    std::fs::write(&response, serde_json::to_string(&fixture).unwrap()).unwrap();
+    let db = dir.path().join("db").display().to_string();
+    Command::cargo_bin("figmog")
+        .unwrap()
+        .args([
+            "pull",
+            "--from-file",
+            response.to_str().unwrap(),
+            "--db",
+            &db,
+        ])
+        .assert()
+        .success();
+
+    let run = |args: &[&str]| {
+        let out = Command::cargo_bin("figmog")
+            .unwrap()
+            .args(args)
+            .args(["--db", &db])
+            .assert()
+            .success();
+        serde_json::from_slice::<serde_json::Value>(&out.get_output().stdout).unwrap()
+    };
+
+    // Premise check: unscoped top-1 is an out-of-scope short match, not
+    // the in-scope one — otherwise this fixture doesn't reproduce I1.
+    let unscoped = run(&["search", "garden", "-n", "1"]);
+    assert_ne!(
+        unscoped[0]["id"], "1:2",
+        "premise: the in-scope match must rank below the out-of-scope ones globally"
+    );
+
+    // The reviewer's exact repro shape: a tight limit under a scope whose
+    // only match is globally outranked must still return it, not [].
+    let scoped = run(&["search", "garden", "-n", "1", "--under", "1:1"]);
+    let ids: Vec<&str> = scoped
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["1:2"],
+        "scoped search ranks the full corpus before truncating"
+    );
+
+    // A wider limit that still fits inside the scope: same single hit,
+    // nothing else under 1:1 matches "garden".
+    let scoped_wide = run(&["search", "garden", "-n", "5", "--under", "1:1"]);
+    assert_eq!(scoped_wide.as_array().unwrap().len(), 1);
+    assert_eq!(scoped_wide[0]["id"], "1:2");
+}
+
 // ---- v0.0.2 §6: --resolve-vars ----
 
 #[test]
@@ -971,4 +1120,31 @@ fn get_dump_and_path_accept_a_full_figma_url_as_the_node_id() {
         .map(|r| r["id"].as_str().unwrap())
         .collect();
     assert_eq!(ids, vec!["0:0", "0:1", "1:1"]);
+}
+
+/// Review fix I2: `--page` is a node-id argument too (a page id), and
+/// hadn't been routed through the same URL-aware normalization as
+/// `id`/`under`/`target` — a pasted Figma URL silently matched nothing.
+#[test]
+fn page_argument_accepts_a_full_figma_url() {
+    let (_dir, db) = fixture_db();
+    let run = |args: &[&str]| {
+        let out = Command::cargo_bin("figmog")
+            .unwrap()
+            .args(args)
+            .args(["--db", &db])
+            .assert()
+            .success();
+        serde_json::from_slice::<serde_json::Value>(&out.get_output().stdout).unwrap()
+    };
+
+    let bare = run(&["find", "--type", "TEXT", "--page", "0:1"]);
+    let url = "https://www.figma.com/design/flAtUnMfzvA5daBSTFQK35/Fixture?node-id=0-1&t=abc-1";
+    let via_url = run(&["find", "--type", "TEXT", "--page", url]);
+    assert_eq!(
+        bare, via_url,
+        "a page URL matches the same rows as its bare id"
+    );
+    assert_eq!(bare.as_array().unwrap().len(), 1);
+    assert_eq!(bare[0]["id"], "1:2");
 }

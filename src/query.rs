@@ -9,7 +9,7 @@ use fold::pipeline::terminal::search::Bm25Reader;
 use fold::pipeline::terminal::{InvertedIndexReader, MultimapReader, TableReader};
 use fold::stream::Readable;
 
-use crate::ident::{normalize_node_id, normalize_node_ref};
+use crate::ident::normalize_node_ref;
 use crate::model::{
     ComponentRec, ComponentSetRec, FileMeta, NodeRec, StyleRec, VariableCollectionRec, VariableRec,
 };
@@ -392,7 +392,9 @@ pub fn subtree<R: Readable>(
 }
 
 /// Nodes by type, optionally within one page and/or scoped to `under`'s
-/// subtree (spec §3: intersects with the page filter).
+/// subtree (spec §3: intersects with the page filter). `page` and `under`
+/// both accept a full Figma URL (spec §2b), same as any other node-id
+/// argument.
 pub fn find<R: Readable>(
     nodes: &TableReader<'_, R, String, NodeRec>,
     children: &MultimapReader<'_, R, String, (u32, String)>,
@@ -405,7 +407,7 @@ pub fn find<R: Readable>(
     // matches the same as `--type FRAME`.
     let mut ids = by_type.search(&node_type.to_uppercase());
     ids.sort();
-    let page = page.as_deref().map(normalize_node_id);
+    let page = page.as_deref().map(normalize_node_ref);
     let scope = resolve_under(nodes, children, under)?;
 
     let mut rows: Vec<(String, String, String)> = ids
@@ -425,11 +427,14 @@ pub fn find<R: Readable>(
 }
 
 /// BM25 search over layer names and text content, optionally scoped to
-/// `under`'s subtree (spec §3). `limit` still caps the BM25 index's own
-/// top-N *before* the scope filter runs (that ranking, not this filter, is
-/// the expensive part) — a scoped call can return fewer than `limit` hits
-/// when some of the top matches fall outside `under`, same as every other
-/// filter here composing with a cap.
+/// `under`'s subtree (spec §3). Scoped calls rank the *entire* matching
+/// corpus before filtering: `Bm25Reader::search` already scores every
+/// matching document internally regardless of `limit` (its own `limit`
+/// only truncates the final sorted list), so passing an effectively
+/// unlimited `limit` here isn't a more expensive query — it just skips
+/// that final truncation until after the scope filter runs, so an
+/// out-of-scope top-k match can't crowd an in-scope one out of the
+/// response. Unscoped calls keep the direct top-`limit` path unchanged.
 pub fn search<R: Readable>(
     text: &TextReader<'_, R>,
     nodes: &TableReader<'_, R, String, NodeRec>,
@@ -440,10 +445,12 @@ pub fn search<R: Readable>(
 ) -> Result<Value, String> {
     let scope = resolve_under(nodes, children, under)?;
     // BM25's own ranking order is deterministic; keep it (do not re-sort).
-    let hits = text.search(query, limit);
+    let search_limit = if scope.is_some() { usize::MAX } else { limit };
+    let hits = text.search(query, search_limit);
     let rows: Vec<Value> = hits
         .iter()
         .filter(|hit| scope.as_ref().is_none_or(|s| s.contains(&hit.val)))
+        .take(limit)
         .filter_map(|hit| {
             let node = nodes.get(&hit.val)?;
             let snippet = node
@@ -830,7 +837,8 @@ pub fn path<R: Readable>(
 
 /// Every TEXT node's `(id, characters, page_id)`, optionally scoped to one
 /// page and/or `under`'s subtree (spec §3: intersects with the page
-/// filter), sorted by id.
+/// filter), sorted by id. `page` and `under` both accept a full Figma URL
+/// (spec §2b), same as any other node-id argument.
 pub fn text<R: Readable>(
     nodes: &TableReader<'_, R, String, NodeRec>,
     children: &MultimapReader<'_, R, String, (u32, String)>,
@@ -840,7 +848,7 @@ pub fn text<R: Readable>(
 ) -> Result<Value, String> {
     let mut ids = by_type.search(&"TEXT".to_string());
     ids.sort();
-    let page = page.as_deref().map(normalize_node_id);
+    let page = page.as_deref().map(normalize_node_ref);
     let scope = resolve_under(nodes, children, under)?;
 
     let mut rows: Vec<(String, String, String)> = ids
@@ -864,7 +872,8 @@ pub fn text<R: Readable>(
 /// Nodes whose `raw` JSON matches an RFC 6901 pointer, optionally by value
 /// and/or scoped to one page and/or `under`'s subtree (spec §3: intersects
 /// with the page filter). Rows `[{id, name, type, page_id, value}]`,
-/// sorted by id.
+/// sorted by id. `page` and `under` both accept a full Figma URL (spec
+/// §2b), same as any other node-id argument.
 pub fn where_<R: Readable>(
     nodes: &TableReader<'_, R, String, NodeRec>,
     children: &MultimapReader<'_, R, String, (u32, String)>,
@@ -878,7 +887,7 @@ pub fn where_<R: Readable>(
             "pointer must be an RFC 6901 pointer starting with '/': {pointer}"
         ));
     }
-    let page = page.as_deref().map(normalize_node_id);
+    let page = page.as_deref().map(normalize_node_ref);
     let scope = resolve_under(nodes, children, under)?;
 
     let mut rows: Vec<(String, String, String, String, Value)> = Vec::new();

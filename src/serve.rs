@@ -521,8 +521,17 @@ fn handle_tool_call(
             // failed call (almost always "no node ... in the mirror" —
             // the node genuinely isn't in the file the explicit arg
             // picked) rather than staying silent about why a URL that
-            // looks right didn't resolve.
-            match (&explicit_file, &url_file_key) {
+            // looks right didn't resolve. `explicit_file` is compared by
+            // its *normalized* key, not its raw text — it can itself be a
+            // full Figma URL (or a bare key) naming the very same file
+            // `url_file_key` already extracted, and a raw-string compare
+            // would false-positive on that (same file, different spelling).
+            // A `file` arg `parse_file_ref` can't make sense of at all
+            // falls back to the raw text so a genuine mismatch still shows.
+            let explicit_key = explicit_file
+                .as_deref()
+                .map(|f| parse_file_ref(f).unwrap_or_else(|| f.to_string()));
+            match (&explicit_key, &url_file_key) {
                 (Some(ef), Some(uf)) if ef != uf => {
                     format!(
                         "{msg} (note: the id/under URL names file {uf}, but the explicit `file` argument {ef} was used instead)"

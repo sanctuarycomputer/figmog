@@ -876,6 +876,81 @@ fn serve_e2e_zero_startup_url_id_infers_the_file_and_resolves_the_node() {
     assert!(status.success(), "figmog serve exited with {status:?}");
 }
 
+/// Review fix I3: the explicit-`file`/URL-file mismatch note (spec §2b)
+/// must compare *normalized* file keys, not raw argument text — an
+/// explicit `file` that's itself a full Figma URL naming the very same
+/// file the `id` URL names is not a disagreement, even though the two
+/// strings look nothing alike. A genuinely different explicit `file` still
+/// gets the note.
+#[test]
+fn serve_e2e_mismatch_note_compares_normalized_file_keys() {
+    let root = build_fixture_root(&[
+        (KEY_A, common::fixture_v1()),
+        (KEY_B, common::fixture_other()),
+    ]);
+    let (mut guard, mut stdin, rx) = spawn_serve_multifile(root.path(), &[]);
+
+    send(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "capabilities": {}},
+        }),
+    );
+    let resp = recv(&rx);
+    assert_eq!(resp["id"], json!(1));
+    send(
+        &mut stdin,
+        &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    );
+
+    // Same file, different spelling: explicit `file` is a full URL naming
+    // KEY_A, `id` is a *different* full URL also naming KEY_A (with an
+    // unknown node id, so the call still fails) — no mismatch, no note.
+    let same_file_url = format!("https://www.figma.com/design/{KEY_A}/Alt-Name");
+    let id_url_a = format!("https://www.figma.com/file/{KEY_A}/Fixture?node-id=99-99");
+    let resp = call(
+        &mut stdin,
+        &rx,
+        2,
+        "figmog_node",
+        json!({"id": id_url_a, "file": same_file_url}),
+    );
+    assert_eq!(resp["result"]["isError"], json!(true));
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(text.contains("99:99"), "text: {text}");
+    assert!(
+        !text.contains("note:"),
+        "same file, different spelling: no mismatch note expected — text: {text}"
+    );
+
+    // Genuinely different files: explicit `file` names KEY_A, `id` is a
+    // URL naming KEY_B — the note must appear and name both keys.
+    let id_url_b = format!("https://www.figma.com/design/{KEY_B}/Other?node-id=99-99");
+    let resp = call(
+        &mut stdin,
+        &rx,
+        3,
+        "figmog_node",
+        json!({"id": id_url_b, "file": KEY_A}),
+    );
+    assert_eq!(resp["result"]["isError"], json!(true));
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(text.contains("note:"), "text: {text}");
+    assert!(text.contains(KEY_A), "text: {text}");
+    assert!(text.contains(KEY_B), "text: {text}");
+
+    drop(stdin);
+    let status = wait_with_timeout(&mut guard.0, TIMEOUT);
+    assert!(status.success(), "figmog serve exited with {status:?}");
+}
+
 /// `--db <path>` with no FILE positional predates multi-file serve (spec
 /// §14 non-goal: CLI multi-file addressing is out of scope) — the single
 /// session it opens has no real Figma key to pull with (see
