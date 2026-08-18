@@ -4,7 +4,7 @@ figmog is a superset of the Figma MCP surface: a local, instantly-queryable
 mirror of your Figma files built for high-performance design agents.
 
 <p align="center">
-  <img src="docs/assets/figmog.png" width="460"
+  <img src="docs/assets/figmog.png" width="100%"
        alt="Figmog is ~17657x faster than Figma's MCP server. Figmog is a local, instantly-queryable mirror of your Figma files. Figmog is built for high-performance design agents.">
 </p>
 
