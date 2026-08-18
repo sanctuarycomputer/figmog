@@ -234,6 +234,18 @@ fn bind_socket(figmog_root: &Path) -> Result<(UnixListener, PathBuf), String> {
 /// return site. Never constructed for a probe that found another serve
 /// owning the root: [`bind_socket`] returns `Err` before creating one in
 /// that case, and that socket file is not this process's to remove.
+///
+/// Best-effort, not a hard guarantee: on filesystems that recycle inode
+/// numbers aggressively (ext4, notably — see the two-live-files-then-
+/// `rename(2)` construction the `socket_guard_does_not_unlink_a_file_
+/// replaced_at_the_same_path` test needs to reliably prove the *positive*
+/// case on Linux), an unlink immediately followed by an unrelated create at
+/// the exact same path could in principle land on the same `(dev, ino)`
+/// this guard bound, purely by chance — no attacker or racer required.
+/// This is an accepted, narrow gap in an already best-effort safety net
+/// (spec §1 has no auth story for the socket beyond filesystem
+/// permissions to begin with), not a design this crate tries to close
+/// further.
 struct SocketGuard {
     path: PathBuf,
     dev: u64,
@@ -1231,14 +1243,29 @@ mod tests {
         // recreating the socket path while serve is still running (m3):
         // the guard must check the file is still the *inode* it bound, not
         // just that "something" exists at the path, before removing it.
+        //
+        // The replacement is built at a *sibling* path while the original
+        // still exists, then moved over the guard's path with `rename(2)`
+        // — the only way to guarantee a genuinely different inode across
+        // platforms. A plain remove-then-recreate at the same path doesn't
+        // reliably do that: ext4 (the common Linux CI filesystem) recycles
+        // inode numbers immediately, so a delete-then-recreate at the same
+        // path can legitimately land on the exact same inode the guard
+        // bound — which would make this test pass for the wrong reason on
+        // Linux (or, as originally written, fail there outright, since two
+        // *simultaneously live* files are guaranteed distinct inodes but a
+        // remove-then-recreate isn't). `rename(2)` preserves the source
+        // inode across the move, so the file at `path` afterward is
+        // provably not the guard's original inode, on every platform.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("root");
         let (listener, path) = bind_socket(&root).unwrap();
         let guard = SocketGuard::new(path.clone()).unwrap();
         drop(listener);
 
-        std::fs::remove_file(&path).unwrap();
-        std::fs::write(&path, b"someone else's file now").unwrap();
+        let replacement = dir.path().join("replacement");
+        std::fs::write(&replacement, b"someone else's file now").unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
 
         drop(guard);
 
