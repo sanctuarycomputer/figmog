@@ -167,26 +167,26 @@ merged list, and `figmog call <tool>` invokes any of them from a shell.
 <details>
 <summary>Per-tool numbers, sync phase, and provenance</summary>
 
-Measured 2026-08-17 on Apple Silicon against a real 5,339-node production
-file.
+Measured 2026-08-17 on Apple Silicon against a real production file: 5,339
+nodes, 5,921,203 bytes, fetched in 4,662.2ms.
 
-| tool | p50 (ms) |
-|---|---|
-| `figmog_node` | 0.055 |
-| `figmog_search` | 0.067 |
-| `figmog_instances` | 0.11 |
-| `figmog_tree` | 0.46 |
-| `figmog_stats` | 16.9 |
-| `figmog_where` | 22.1 |
+Cold sync: 146.0ms flatten plus 81.3ms sync for 5,394 records, 66,364
+records a second. Re-pull of the unchanged file: 4.6ms, churn zero.
 
-Sync phase: re-syncing the unchanged file took 4.6ms and produced zero
-churn. Load phase: 5,000 tool calls in 33.6s, 149 requests a second. The same
-5,000 reads at Figma's Tier-1 budget of ~10 requests a minute would take
-around 500 minutes. The API comparison figure (972.6ms p50) comes from 5 live
-API calls against the same file during the run.
+| tool | calls | p50 (ms) | p95 | p99 | max |
+|---|---|---|---|---|---|
+| `figmog_node` | 834 | 0.055 | 0.069 | 0.082 | 1.482 |
+| `figmog_search` | 834 | 0.067 | 0.124 | 0.191 | 0.621 |
+| `figmog_instances` | 833 | 0.111 | 0.125 | 0.151 | 0.607 |
+| `figmog_tree` | 833 | 0.462 | 0.529 | 0.733 | 2.172 |
+| `figmog_stats` | 833 | 16.892 | 18.587 | 22.385 | 38.561 |
+| `figmog_where` | 833 | 22.057 | 23.686 | 27.551 | 40.437 |
 
-Only the p50 column was kept from that run, so the p95, p99 and max columns
-the harness also prints are absent here.
+Load phase: 5,000 queries in 33.6s, 149 requests a second. API comparison: 5
+live calls against the same file, p50 972.6ms, max 1,189.1ms. `figmog_node`
+at 0.055ms against the `/nodes` p50 of 972.6ms is the 17,657x figure. At
+Figma's Tier-1 budget of ~10 requests a minute, those 5,000 calls take about
+500 minutes.
 
 The harness itself was retired from the binary in v0.0.1's slim-down and
 lives in the repo history: `docs/history/2026-08-16-figmog-bench.md`.
