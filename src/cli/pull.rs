@@ -14,7 +14,7 @@ use crate::ident::parse_file_ref;
 use crate::store::{self, Churn, collect_sweepable, collect_variable_ids, sync};
 use crate::watch::BACKOFF_CAP;
 
-use super::{CURRENT_FILE, Db, open_store_checked, write_json};
+use super::{Db, current_file, open_store_checked, write_json};
 
 /// Errors from [`do_pull`]: either a typed API failure (so callers can act
 /// on rate limits) or any other pull-mechanics failure. `Display` matches
@@ -235,8 +235,11 @@ pub(crate) fn now_ms() -> u64 {
 }
 
 pub(crate) fn write_current(key: &str) -> Result<(), String> {
-    std::fs::create_dir_all(".figmog").map_err(|e| e.to_string())?;
-    std::fs::write(CURRENT_FILE, key).map_err(|e| e.to_string())
+    let path = current_file();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(path, key).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

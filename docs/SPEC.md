@@ -292,7 +292,10 @@ type like `get_screenshot`'s image block).
 
 ## 6a. The unix-socket control plane
 
-`figmog serve` binds `<figmog-root>/serve.sock` (mode 0600, inside a root
+The figmog-root is `--figmog-root` on `serve`, else `$FIGMOG_ROOT`, else
+`.figmog` relative to the cwd; the CLI derives its own root from the same
+`$FIGMOG_ROOT`/`.figmog` rule (`cli::socket::default_root`) so both sides
+agree. `figmog serve` binds `<figmog-root>/serve.sock` (mode 0600, inside a root
 tightened to 0700) before it opens any session store, and unlinks it on
 exit through a guard held for `run_serve`'s whole scope. A pre-existing
 socket file is probed with a connect first (`serve::classify_probe`):

@@ -53,6 +53,34 @@ server's tools, with caching, whenever the Figma desktop app is running, so
 dropping the direct connection loses nothing. Keep both and the agent sees
 two overlapping Figma servers, then picks tools badly.
 
+### 3c. Or connect it to any other MCP client
+
+Every MCP client (Cursor, Codex, Windsurf, pi, and so on) takes the same
+stdio shape. Drop this into its `mcp.json`, adjusting the binary path:
+
+```json
+{
+  "mcpServers": {
+    "figmog": {
+      "command": "/absolute/path/to/figmog",
+      "args": ["serve"],
+      "env": {
+        "FIGMA_TOKEN": "figd_…",
+        "FIGMOG_ROOT": "/Users/you/.figmog"
+      }
+    }
+  }
+}
+```
+
+`FIGMOG_ROOT` pins where figmog keeps its mirrors. Without it, `serve`
+uses `.figmog` inside whatever directory the client launched it from,
+which for a global MCP config means a stray `.figmog` in every project.
+One `serve` process owns a root at a time, so give each agent that runs
+concurrently its own `FIGMOG_ROOT` (`~/.figmog/cursor`, `~/.figmog/pi`,
+…). The CLI honours the same variable, so `FIGMOG_ROOT=~/.figmog/pi
+figmog pages` reads what that agent mirrored.
+
 ### 4. Ask for something
 
 > Using figmog, pull this file: [figma file URL], then build this frame in

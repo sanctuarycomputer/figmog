@@ -8,11 +8,11 @@
 //! Socket routing only applies when the root is knowable at all: `--db`
 //! bypasses the whole multi-file root concept (an arbitrary store path has
 //! no `<root>/serve.sock` to speak of), so callers in `super::dispatch`
-//! only reach this module when `cli.db.is_none()`. [`DEFAULT_ROOT`] is the
-//! CLI's own root — it has no `--figmog-root` override (that's `serve`'s
-//! hidden testability knob only), so this constant must match
+//! only reach this module when `cli.db.is_none()`. [`default_root`] is the
+//! CLI's own root — `$FIGMOG_ROOT` or `.figmog` — and must match
 //! [`crate::serve`]'s own default figmog-root exactly for socket routing to
-//! ever find the right process.
+//! ever find the right process (`serve --figmog-root` shares the same
+//! default, so the two only diverge when that flag is passed explicitly).
 //!
 //! Every function here returns `None` (not `Some(Err(..))`) for "no serve
 //! reachable at this root" — a plain connection failure — so the caller
@@ -29,10 +29,16 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-/// The CLI's multi-file root when `--db` was not passed — always `.figmog`
-/// relative to the current directory, matching `crate::serve::run_serve`'s
-/// own `--figmog-root` default (see this module's doc comment).
-pub(super) const DEFAULT_ROOT: &str = ".figmog";
+/// The CLI's multi-file root when `--db` was not passed — `$FIGMOG_ROOT`
+/// if set, else `.figmog` relative to the current directory. Matches
+/// `crate::serve::run_serve`'s own `--figmog-root` default exactly (see
+/// this module's doc comment), so socket routing finds the right process.
+pub(crate) fn default_root() -> PathBuf {
+    std::env::var_os("FIGMOG_ROOT")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(".figmog"))
+}
 
 /// `<root>/serve.sock` — must match [`crate::serve::socket_path`] exactly.
 fn socket_path(root: &Path) -> PathBuf {
