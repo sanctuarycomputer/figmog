@@ -1402,3 +1402,56 @@ fn images_with_no_ids_is_rejected_by_clap() {
         "expected clap to reject a missing required `ids` argument: {stderr}"
     );
 }
+
+/// `FIGMOG_ROOT` relocates the default multi-file root (`<root>/<key>/db`
+/// and `<root>/current`) away from the cwd-relative `.figmog`, so an agent's
+/// MCP config can pin one stable store per agent regardless of which
+/// project directory it launches from. A `pull` under one cwd must land in
+/// `$FIGMOG_ROOT`, and a read command from a *different* cwd must find it.
+#[test]
+fn figmog_root_env_relocates_default_root() {
+    let root = tempfile::tempdir().unwrap();
+    let cwd_a = tempfile::tempdir().unwrap();
+    let cwd_b = tempfile::tempdir().unwrap();
+    let response = cwd_a.path().join("resp.json");
+    std::fs::write(
+        &response,
+        serde_json::to_string(&common::fixture_v1()).unwrap(),
+    )
+    .unwrap();
+    let url = "https://www.figma.com/design/flAtUnMfzvA5daBSTFQK35/Fixture";
+
+    Command::cargo_bin("figmog")
+        .unwrap()
+        .args(["pull", url, "--from-file", response.to_str().unwrap()])
+        .env("FIGMOG_ROOT", root.path())
+        .current_dir(cwd_a.path())
+        .assert()
+        .success();
+
+    assert!(
+        root.path()
+            .join("flAtUnMfzvA5daBSTFQK35")
+            .join("db")
+            .is_dir(),
+        "store must live under $FIGMOG_ROOT"
+    );
+    assert!(root.path().join("current").is_file());
+    assert!(
+        !cwd_a.path().join(".figmog").exists(),
+        "cwd-relative .figmog must not be created when FIGMOG_ROOT is set"
+    );
+
+    let out = Command::cargo_bin("figmog")
+        .unwrap()
+        .args(["--no-socket", "pages"])
+        .env("FIGMOG_ROOT", root.path())
+        .current_dir(cwd_b.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let pages: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert!(pages.as_array().is_some_and(|p| !p.is_empty()));
+}

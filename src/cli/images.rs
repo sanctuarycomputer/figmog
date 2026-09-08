@@ -24,7 +24,7 @@
 //! manifest-shaped error JSON, exit 1" — this command never falls through
 //! to the generic `{"error": ...}` shape other commands use).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde_json::{Value, json};
 
@@ -47,7 +47,7 @@ pub(super) fn cmd_images(
     let fetched = if !no_socket
         && !db_given
         && let Some(result) = socket::try_images_call(
-            Path::new(socket::DEFAULT_ROOT),
+            &socket::default_root(),
             json!({"ids": ids, "format": format, "scale": scale, "file": db.key}),
         ) {
         from_socket_result(result?)?

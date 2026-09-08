@@ -7,7 +7,7 @@
 //! keeps the clap types, top-level dispatch, `run`, and the store-opening/
 //! JSON-writing helpers every submodule shares.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
@@ -79,10 +79,10 @@ enum Cmd {
         #[arg(long)]
         no_upstream: bool,
         /// Root directory for multi-file session stores (`<root>/<key>/db`
-        /// — spec §14). Hidden: testability knob so e2e tests can point
-        /// startup files at pre-built fixture stores under a temp dir
-        /// instead of the real `.figmog`.
-        #[arg(long, default_value = ".figmog", hide = true)]
+        /// — spec §14). Defaults to `$FIGMOG_ROOT`, else `.figmog` in the
+        /// current directory. Set `FIGMOG_ROOT` in an agent's MCP config to
+        /// keep one stable store per agent regardless of the project cwd.
+        #[arg(long, default_value_os_t = socket::default_root())]
         figmog_root: PathBuf,
     },
     /// List every tool figmog would serve: the local registry, plus
@@ -327,7 +327,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
     {
         if !cli.no_socket
             && cli.db.is_none()
-            && let Some(result) = socket::try_tools_list(Path::new(socket::DEFAULT_ROOT))
+            && let Some(result) = socket::try_tools_list(&socket::default_root())
         {
             let tools = result?;
             note_ignored_upstream_flags(upstream, *no_upstream);
@@ -346,7 +346,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
     // has no `<root>/serve.sock` to speak of), so this is skipped whenever
     // `cli.db` was given, exactly like `--no-socket`.
     if !cli.no_socket && cli.db.is_none() {
-        let root = Path::new(socket::DEFAULT_ROOT);
+        let root = &socket::default_root();
         if let Cmd::Call {
             tool,
             args,
@@ -761,7 +761,9 @@ struct Db {
     key: Option<String>,
 }
 
-const CURRENT_FILE: &str = ".figmog/current";
+fn current_file() -> PathBuf {
+    socket::default_root().join("current")
+}
 
 fn resolve_db(cli: &Cli) -> Result<Db, String> {
     if let Some(path) = &cli.db {
@@ -797,7 +799,7 @@ fn resolve_db(cli: &Cli) -> Result<Db, String> {
 /// serve's own default apply, unchanged" — see [`with_current_file`]).
 /// Shared so both call sites derive the current mirror identically.
 fn read_current_key() -> Option<String> {
-    let key = std::fs::read_to_string(CURRENT_FILE).ok()?;
+    let key = std::fs::read_to_string(current_file()).ok()?;
     let key = key.trim();
     if key.is_empty() {
         None
@@ -824,7 +826,7 @@ fn no_mirror_msg(cli: &Cli) -> String {
 }
 
 fn db_path_for(key: &str) -> PathBuf {
-    PathBuf::from(".figmog").join(key).join("db")
+    socket::default_root().join(key).join("db")
 }
 
 /// The clean, user-facing error every CLI store-opening call site below
