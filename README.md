@@ -27,6 +27,9 @@ $ xattr -d com.apple.quarantine ./figmog   # macOS only, see Install
 Tarballs live on the
 [releases page](https://github.com/net-work-studio/figmog/releases).
 
+Check the installed version with `figmog version` (JSON output) or
+`figmog --version` / `figmog -V` (plain text).
+
 ### 2. Save a Figma token
 
 ```console

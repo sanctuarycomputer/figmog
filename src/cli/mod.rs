@@ -25,7 +25,11 @@ mod socket;
 pub(crate) use pull::{PullError, now_ms, pull_failure_wait, write_current};
 
 #[derive(Parser)]
-#[command(name = "figmog", about = "fold-backed local mirror of a Figma file")]
+#[command(
+    name = "figmog",
+    version,
+    about = "fold-backed local mirror of a Figma file"
+)]
 struct Cli {
     /// Store directory (default: .figmog/<file-key>/db).
     #[arg(long, global = true)]
@@ -42,6 +46,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Print the installed figmog version.
+    Version,
     /// Save, inspect, or remove your Figma credentials.
     Auth {
         #[command(subcommand)]
@@ -286,6 +292,9 @@ fn write_json(v: &Value) -> Result<(), String> {
 }
 
 fn dispatch(cli: Cli) -> Result<(), String> {
+    if let Cmd::Version = &cli.cmd {
+        return write_json(&json!({"version": env!("CARGO_PKG_VERSION")}));
+    }
     if let Cmd::Auth { command } = &cli.cmd {
         return auth::run(command);
     }
@@ -567,7 +576,8 @@ fn dispatch(cli: Cli) -> Result<(), String> {
                     read::cmd_where(&nodes, &children, pointer, equals, page, under)
                 }),
                 Cmd::At { x, y } => st.rtx(|((nodes, ..), ..)| read::cmd_at(&nodes, x, y)),
-                Cmd::Auth { .. }
+                Cmd::Version
+                | Cmd::Auth { .. }
                 | Cmd::Pull { .. }
                 | Cmd::ImportVariables { .. }
                 | Cmd::Serve { .. }
@@ -755,7 +765,8 @@ fn cmd_as_tool_call(cmd: &Cmd) -> Option<(&'static str, Value)> {
             }),
         )),
         Cmd::At { x, y } => Some(("figmog_at", json!({"x": x, "y": y}))),
-        Cmd::Auth { .. }
+        Cmd::Version
+        | Cmd::Auth { .. }
         | Cmd::Pull { .. }
         | Cmd::Serve { .. }
         | Cmd::Tools { .. }

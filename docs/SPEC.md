@@ -420,6 +420,11 @@ comment in `src/cli/mod.rs`). A reader that vanishes mid-write (piped
 into `head`, a killed consumer) is a silent, clean exit 0, never a panic
 or a broken-pipe message.
 
+`figmog version` reports the installed package version as `{"version": "..."}`
+without resolving a mirror, opening a store, or accessing credentials.
+The standard clap flags `--version` / `-V` print `figmog <version>` as plain
+text and exit before dispatch, like `--help`.
+
 The CLI is split by concern: `src/cli/mod.rs` (clap types, top-level
 dispatch, `run`, the shared store-opening/JSON-writing helpers),
 `src/cli/pull.rs` (`pull`, the typed `PullError`, `.figmog/current`),
