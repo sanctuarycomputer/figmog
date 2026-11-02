@@ -30,8 +30,8 @@ removed) verbatim, for provenance only — don't treat them as current.
 - **`fold`/`bogkit` is upstream.** Never vendored, never patched — consume
   only the pinned git dependency's public API.
 - **Gates for any change:** `cargo test`, `cargo clippy --no-deps
-  --all-targets -- -D warnings`, `cargo fmt --check`, and `cargo doc
-  --no-deps` warning-free.
+--all-targets -- -D warnings`, `cargo fmt --check`, and `cargo doc
+--no-deps` warning-free.
 - **No new dependencies without a written justification in the PR.**
 - **Fixtures are synthetic only** — nothing derived from real client
   files.
@@ -52,7 +52,7 @@ removed) verbatim, for provenance only — don't treat them as current.
   clean exit-1 message.
 - **The empty `[workspace]` table in `Cargo.toml` is deliberate, not
   leftover.** It guards against Cargo silently treating figmog as a
-  member of some *enclosing* workspace if this repo is ever checked out
+  member of some _enclosing_ workspace if this repo is ever checked out
   nested inside another Cargo project — an empty `[workspace]` pins this
   crate as its own workspace root regardless of what's above it.
   Harmless (and currently a no-op) as a standalone repo with nothing
