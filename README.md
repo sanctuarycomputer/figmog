@@ -260,12 +260,41 @@ $ cd figmog && cargo build --release
 That needs a Rust toolchain and network access, since the build fetches
 `fold` from its pinned git rev.
 
-For maintainers: pushing a `v*` tag starts the Release workflow. To release
-an existing tag whose original workflow never ran, open Actions → Release →
-Run workflow, select `main`, and enter the tag (for example, `v0.0.3`). The
-workflow builds the tag's commit and publishes the three tarballs and
-`SHA256SUMS` as a GitHub pre-release. The tag must already exist; this does
-not create or move it. No custom repository secrets are required.
+### Building release tarballs
+
+CI and release jobs run on Blacksmith, using Ubuntu 24.04 for Linux and
+macOS 15 on Apple Silicon for both macOS targets.
+
+CI runs tests on pushes to `main` and on pull requests. It does not build
+release tarballs. The separate [Release workflow](https://github.com/net-work-studio/figmog/actions/workflows/release.yml)
+starts when a `v*` tag is pushed, or when a maintainer runs it manually.
+Merging a PR, bumping `Cargo.toml`, or having an existing tag does not start
+a release by itself.
+
+To build an existing tag whose release never ran, open Actions → Release →
+Run workflow, select `main`, and enter the tag (for example, `v0.0.3`), or
+use the GitHub CLI:
+
+```sh
+gh workflow run release.yml --repo net-work-studio/figmog --ref main -f tag=v0.0.3
+```
+
+This uses the workflow from `main` to build the existing tag's commit; it
+does not create or move the tag. To publish a future version, first merge
+the version bump and changes into `main`, then tag that commit and push the
+new tag (replace `vX.Y.Z` with the version):
+
+```sh
+git fetch origin main
+git tag -a vX.Y.Z origin/main -m "Release vX.Y.Z"
+git push origin vX.Y.Z
+```
+
+The Release workflow builds macOS ARM64, macOS Intel, and Linux x86_64
+binaries, packages them as three `.tar.gz` files, generates `SHA256SUMS`,
+and publishes all four files as a GitHub pre-release. Follow progress in
+Actions → Release; downloads appear on the releases page after the publish
+job succeeds. No custom repository secrets are required.
 
 ## Limitations
 

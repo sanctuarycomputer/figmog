@@ -13,10 +13,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+        runner: [blacksmith-4vcpu-ubuntu-2404, blacksmith-6vcpu-macos-15]
+    runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install stable Rust
         run: |
@@ -24,7 +24,7 @@ jobs:
           rustup component add rustfmt clippy
 
       - name: Cache cargo registry, git, and build output
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
