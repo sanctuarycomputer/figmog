@@ -10,7 +10,9 @@ use serde_json::Value;
 pub enum ApiError {
     #[error("rate limited; retry after {retry_after:?}")]
     RateLimited { retry_after: Duration },
-    #[error("authentication failed — check FIGMA_TOKEN and file access")]
+    #[error(
+        "authentication failed — check your saved token (`figmog auth login`), FIGMA_TOKEN, and file access"
+    )]
     Auth,
     #[error("figma returned {status}: {msg}")]
     Http { status: u16, msg: String },
@@ -165,7 +167,7 @@ pub struct UreqApi {
 
 impl UreqApi {
     /// Client against the real `api.figma.com`, authenticated with a
-    /// personal access token (`FIGMA_TOKEN`).
+    /// personal access token (saved credential or `FIGMA_TOKEN`).
     pub fn new(token: String) -> Self {
         Self::with_base_url(token, "https://api.figma.com".into())
     }

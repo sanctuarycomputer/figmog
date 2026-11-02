@@ -155,8 +155,7 @@ pub fn fixture_db() -> (tempfile::TempDir, std::path::PathBuf) {
     let response = dir.path().join("resp.json");
     std::fs::write(&response, serde_json::to_string(&fixture_v1()).unwrap()).unwrap();
     let db = dir.path().join("db");
-    Command::cargo_bin("figmog")
-        .unwrap()
+    command()
         .args([
             "pull",
             "--from-file",
@@ -167,4 +166,13 @@ pub fn fixture_db() -> (tempfile::TempDir, std::path::PathBuf) {
         .assert()
         .success();
     (dir, db)
+}
+
+/// Every subprocess test must be independent of the developer's saved
+/// credential and exported token. Empty FIGMA_TOKEN disables both.
+#[allow(dead_code)]
+pub fn command() -> Command {
+    let mut command = Command::cargo_bin("figmog").unwrap();
+    command.env("FIGMA_TOKEN", "");
+    command
 }

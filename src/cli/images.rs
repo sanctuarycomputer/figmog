@@ -129,7 +129,7 @@ fn fetch_direct(
     let scanned = st.rtx(|((nodes, ..), _, _, _, _, _, meta, _, _, images_table)| {
         images::scan(&nodes, &meta, &images_table, &node_ids, format, scale_m)
     });
-    let token = std::env::var("FIGMA_TOKEN").ok();
+    let token = crate::auth::token()?;
     let api = token.map(UreqApi::new);
     let download = crate::api::download_bytes;
     let items = images::resolve(

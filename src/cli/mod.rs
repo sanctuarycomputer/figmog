@@ -14,7 +14,9 @@ use serde_json::{Value, json};
 
 use crate::ident::parse_file_ref;
 
+mod auth;
 mod call;
+mod gitignore;
 mod images;
 mod pull;
 mod read;
@@ -40,6 +42,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Save, inspect, or remove your Figma credentials.
+    Auth {
+        #[command(subcommand)]
+        command: auth::AuthCommand,
+    },
     /// Fetch the file (or read a saved response) and sync the mirror.
     Pull {
         /// File key or figma.com URL. Optional after the first pull.
@@ -279,6 +286,9 @@ fn write_json(v: &Value) -> Result<(), String> {
 }
 
 fn dispatch(cli: Cli) -> Result<(), String> {
+    if let Cmd::Auth { command } = &cli.cmd {
+        return auth::run(command);
+    }
     // `serve` manages its own (possibly many) session stores via
     // `SessionManager` (`sessions.rs`) rather than the single `Db` every
     // other command resolves below — handled here, before `resolve_db`,
@@ -557,7 +567,8 @@ fn dispatch(cli: Cli) -> Result<(), String> {
                     read::cmd_where(&nodes, &children, pointer, equals, page, under)
                 }),
                 Cmd::At { x, y } => st.rtx(|((nodes, ..), ..)| read::cmd_at(&nodes, x, y)),
-                Cmd::Pull { .. }
+                Cmd::Auth { .. }
+                | Cmd::Pull { .. }
                 | Cmd::ImportVariables { .. }
                 | Cmd::Serve { .. }
                 | Cmd::Tools { .. }
@@ -744,7 +755,8 @@ fn cmd_as_tool_call(cmd: &Cmd) -> Option<(&'static str, Value)> {
             }),
         )),
         Cmd::At { x, y } => Some(("figmog_at", json!({"x": x, "y": y}))),
-        Cmd::Pull { .. }
+        Cmd::Auth { .. }
+        | Cmd::Pull { .. }
         | Cmd::Serve { .. }
         | Cmd::Tools { .. }
         | Cmd::Call { .. }

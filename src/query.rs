@@ -892,7 +892,7 @@ pub fn where_<R: Readable>(
 
     let mut rows: Vec<(String, String, String, String, Value)> = Vec::new();
     for (_, n) in nodes.iter() {
-        if !page.as_deref().is_none_or(|p| n.page_id == p) {
+        if page.as_deref().is_some_and(|p| n.page_id != p) {
             continue;
         }
         if !scope.as_ref().is_none_or(|s| s.contains(&n.id)) {

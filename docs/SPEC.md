@@ -428,11 +428,66 @@ dispatch, `run`, the shared store-opening/JSON-writing helpers),
 surface, so every tool `figmog serve` would expose is reachable without
 an MCP client), `src/cli/images.rs` (`images`, §15), and
 `src/cli/socket.rs` (the client half of the control plane, §6a).
+`src/cli/auth.rs` handles credential commands and hidden terminal input;
+`src/auth.rs` owns credential resolution and native storage.
 
 `figmog tools` never opens the store (it only needs an optional upstream
-probe), so unlike every other command it does **not** require a resolved
-mirror — no established `.figmog/current` and no `--db` needed. `figmog
-call` does need one, since local tool dispatch reads the store.
+probe), and `figmog auth` manages credentials independently. Neither
+requires a resolved mirror — no established `.figmog/current` and no
+`--db` needed. `figmog call` does need one, since local tool dispatch
+reads the store.
+
+**Credentials.** `figmog auth login` reads a personal access token from a
+hidden terminal prompt, or from stdin with `--token-stdin`. It rejects
+empty, multiline, non-ASCII, and oversized tokens (4096-byte maximum),
+stores one token per OS user under service `figmog`, account
+`figma-token`, and returns `saved`, `storage`, and `environment_override`
+as JSON. Storage is macOS Keychain or Linux Secret Service; there is no
+plaintext-file fallback. Saving does not validate the token over the
+network or require extra Figma scopes. `auth status` returns `configured`,
+`source` (`environment`, `credential_store`, or null), and `validated:
+false`, without disclosing the token. `auth logout` removes only the
+saved credential, is idempotent, and reports `removed` plus whether an
+environment override remains.
+
+`pull`, `serve`, and direct image downloads use the same credential
+loader: explicit `FIGMA_TOKEN` first, otherwise the saved credential.
+An explicitly empty environment value disables saved credentials. A
+locked/unavailable store is treated as no usable token for these callers,
+so cached reads and token-free idle servers still work; `auth status`
+reports the storage error for diagnosis. Credential changes take effect
+on the next CLI invocation or server restart. Tokens remain subject to
+Figma expiration/revocation; this is personal-token storage, not OAuth.
+
+The new dependencies are justified by native secret storage (`keyring`)
+and terminal echo suppression (`rpassword`), avoiding plaintext files,
+secrets in argv, shell credential helpers, and hand-written terminal
+handling. The Linux DBus client is vendored so release builds do not
+require DBus development headers; an unlocked Secret Service is still
+required at runtime for saved credentials. Automated tests use isolated
+in-memory credentials and explicitly disable real credentials in child
+processes. The ignored `auth::tests::native_credential_store_round_trip`
+test exercises a disposable native entry when a store is available.
+
+**Git ignore rules.** After a successful CLI `pull` into the default local
+mirror (including `--from-file`), inspect ancestors up to the nearest
+`.git` directory or file, recognizing worktree/submodule boundaries.
+If Git does not already ignore `.figmog/`, append that pattern to the
+closest existing `.gitignore` within the repository; create the root
+`.gitignore` if absent. Preserve existing content and line endings.
+Failed pulls, explicit `--db` paths, and directories outside Git do not
+change ignore rules. Symlink/nonregular ignore files are not modified.
+All in-repository ancestor ignore files are checked before invoking Git,
+and the Git check is limited to two seconds so external exclude files
+cannot stall a completed pull indefinitely. The query checks `.figmog`
+without a trailing slash to distinguish a directory ignore from a
+contents-only rule with descendant exceptions. Appends read and write
+through one descriptor; on Unix, `O_NOFOLLOW` and `O_NONBLOCK` prevent
+swapped symlinks/FIFOs from redirecting or blocking the open. `libc` is
+used directly for these OS flags (it was already a transitive dependency).
+Ignore-update failures emit a JSON warning on stderr without failing an
+already successful pull. This does not untrack committed files or share
+mirror data between worktrees.
 
 **Socket-first routing (§6a).** When neither `--no-socket` nor `--db` is
 given, every read command, plus `tools`, `call` and `images`, first tries

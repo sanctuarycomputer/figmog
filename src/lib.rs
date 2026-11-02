@@ -10,6 +10,7 @@
 //! See `docs/history/2026-08-15-figmog-build-design.md`.
 
 pub(crate) mod api;
+pub(crate) mod auth;
 pub mod cache;
 pub mod cli;
 mod dispatch;

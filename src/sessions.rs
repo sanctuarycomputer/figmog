@@ -230,9 +230,9 @@ pub(crate) fn open_session_at(
             let key = network_key.clone().ok_or_else(|| {
                 PullError::from("no file key: pass a file key or figma.com URL".to_string())
             })?;
-            let token = token.clone().ok_or_else(|| {
-                PullError::from("FIGMA_TOKEN not set — required for network pulls".to_string())
-            })?;
+            let token = token
+                .clone()
+                .ok_or_else(|| PullError::from(crate::auth::missing_token("network pulls")))?;
             // Sticky vector geometry (spec §4): what this pull requests
             // combines its own override (`figmog_open`'s `geometry` arg,
             // or `false` from every other caller — see `PullFn`'s doc

@@ -84,7 +84,7 @@ fn spawn_serve_multifile(
     cmd.args(["serve", "--no-watch", "--no-upstream", "--figmog-root"])
         .arg(root)
         .args(files)
-        .env_remove("FIGMA_TOKEN");
+        .env("FIGMA_TOKEN", "");
     spawn_child(cmd)
 }
 
@@ -95,6 +95,7 @@ fn spawn_serve_multifile(
 /// the bounded `recv_timeout` in [`recv`], never the test thread itself.
 fn spawn_child(mut cmd: Command) -> (ChildGuard, ChildStdin, Receiver<String>) {
     let mut child = cmd
+        .env("FIGMA_TOKEN", "")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -137,8 +138,7 @@ fn build_fixture_root(entries: &[(&str, Value)]) -> tempfile::TempDir {
         let resp = dir.path().join(format!("{key}.json"));
         std::fs::write(&resp, serde_json::to_string(fixture).unwrap()).unwrap();
         let db = dir.path().join(key).join("db");
-        assert_cmd::Command::cargo_bin("figmog")
-            .unwrap()
+        common::command()
             .args(["pull", "--from-file"])
             .arg(&resp)
             .arg("--db")
@@ -390,8 +390,7 @@ fn cli_read_against_a_store_serve_holds_fails_clean_not_with_a_panic() {
     let resp = recv(&rx);
     assert_eq!(resp["result"]["serverInfo"]["name"], json!("figmog"));
 
-    let out = assert_cmd::Command::cargo_bin("figmog")
-        .unwrap()
+    let out = common::command()
         .args(["status", "--db"])
         .arg(&db)
         .assert()
@@ -1055,8 +1054,7 @@ fn serve_e2e_no_watch_default_root_startup_does_not_write_figmog_current() {
     )
     .unwrap();
     let db = cwd.path().join(".figmog").join(KEY_A).join("db");
-    assert_cmd::Command::cargo_bin("figmog")
-        .unwrap()
+    common::command()
         .args(["pull", "--from-file"])
         .arg(&response)
         .arg("--db")
@@ -1068,7 +1066,7 @@ fn serve_e2e_no_watch_default_root_startup_does_not_write_figmog_current() {
     let mut cmd = Command::new(bin);
     cmd.args(["serve", "--no-watch", "--no-upstream", KEY_A])
         .current_dir(cwd.path())
-        .env_remove("FIGMA_TOKEN");
+        .env("FIGMA_TOKEN", "");
     let (mut guard, mut stdin, rx) = spawn_child(cmd);
 
     send(
@@ -1122,8 +1120,7 @@ fn default_root_fixture(key: &str, fixture: Value) -> tempfile::TempDir {
     std::fs::write(&response, serde_json::to_string(&fixture).unwrap()).unwrap();
     let figmog_dir = dir.path().join(".figmog");
     let db = figmog_dir.join(key).join("db");
-    assert_cmd::Command::cargo_bin("figmog")
-        .unwrap()
+    common::command()
         .args(["pull", "--from-file"])
         .arg(&response)
         .arg("--db")
@@ -1145,8 +1142,7 @@ fn default_root_fixture_multi(entries: &[(&str, Value)], current: &str) -> tempf
         let response = dir.path().join(format!("{key}.json"));
         std::fs::write(&response, serde_json::to_string(fixture).unwrap()).unwrap();
         let db = figmog_dir.join(key).join("db");
-        assert_cmd::Command::cargo_bin("figmog")
-            .unwrap()
+        common::command()
             .args(["pull", "--from-file"])
             .arg(&response)
             .arg("--db")
@@ -1176,7 +1172,7 @@ fn spawn_default_root_serve_keys(
         .args(keys)
         .args(extra_args)
         .current_dir(cwd)
-        .env_remove("FIGMA_TOKEN");
+        .env("FIGMA_TOKEN", "");
     spawn_child(cmd)
 }
 
@@ -1232,8 +1228,7 @@ fn socket_status_returns_fresh_data_with_no_lock_error() {
     let (mut guard, mut stdin, rx) = spawn_default_root_serve(dir.path(), KEY, &[]);
     handshake(&mut stdin, &rx);
 
-    let out = assert_cmd::Command::cargo_bin("figmog")
-        .unwrap()
+    let out = common::command()
         .arg("status")
         .current_dir(dir.path())
         .assert()
@@ -1268,8 +1263,7 @@ fn socket_call_figmog_sync_reaches_the_owning_process_not_a_local_lock_error() {
     let (mut guard, mut stdin, rx) = spawn_default_root_serve(dir.path(), KEY, &[]);
     handshake(&mut stdin, &rx);
 
-    let out = assert_cmd::Command::cargo_bin("figmog")
-        .unwrap()
+    let out = common::command()
         .args(["call", "figmog_sync"])
         .current_dir(dir.path())
         .assert()
@@ -1291,7 +1285,8 @@ fn socket_call_figmog_sync_reaches_the_owning_process_not_a_local_lock_error() {
         .as_str()
         .unwrap_or_else(|| panic!("expected an \"error\" string field, got: {parsed}"));
     assert!(
-        err.contains("FIGMA_TOKEN not set"),
+        err.contains("FIGMA_TOKEN is empty")
+            && err.contains("unset FIGMA_TOKEN to use saved credentials"),
         "expected serve's own sync error, got: {err}"
     );
     assert!(
@@ -1318,8 +1313,7 @@ fn no_socket_flag_forces_the_old_lock_error() {
     let (mut guard, mut stdin, rx) = spawn_default_root_serve(dir.path(), KEY, &[]);
     handshake(&mut stdin, &rx);
 
-    let out = assert_cmd::Command::cargo_bin("figmog")
-        .unwrap()
+    let out = common::command()
         .args(["status", "--no-socket"])
         .current_dir(dir.path())
         .assert()
@@ -1371,8 +1365,7 @@ fn images_with_db_flag_bypasses_the_socket_even_when_serve_is_reachable() {
         serde_json::to_string(&common::fixture_other()).unwrap(),
     )
     .unwrap();
-    assert_cmd::Command::cargo_bin("figmog")
-        .unwrap()
+    common::command()
         .args(["pull", "--from-file"])
         .arg(&response)
         .arg("--db")
@@ -1380,10 +1373,9 @@ fn images_with_db_flag_bypasses_the_socket_even_when_serve_is_reachable() {
         .assert()
         .success();
 
-    let out = assert_cmd::Command::cargo_bin("figmog")
-        .unwrap()
+    let out = common::command()
         .current_dir(dir.path())
-        .env_remove("FIGMA_TOKEN")
+        .env("FIGMA_TOKEN", "")
         .args(["images", "1:1", "--db"])
         .arg(&other_db)
         .assert()
@@ -1457,11 +1449,10 @@ fn second_serve_on_same_root_exits_with_clean_error() {
     let (mut guard, mut stdin, rx) = spawn_default_root_serve(dir.path(), KEY, &[]);
     handshake(&mut stdin, &rx);
 
-    let out = assert_cmd::Command::cargo_bin("figmog")
-        .unwrap()
+    let out = common::command()
         .args(["serve", "--no-watch", "--no-upstream"])
         .current_dir(dir.path())
-        .env_remove("FIGMA_TOKEN")
+        .env("FIGMA_TOKEN", "")
         .assert()
         .failure();
     let output = out.get_output();
@@ -1540,8 +1531,7 @@ fn socket_status_targets_current_mirror_not_servers_own_default() {
         spawn_default_root_serve_keys(dir.path(), &[FIRST, SECOND], &[]);
     handshake(&mut stdin, &rx);
 
-    let out = assert_cmd::Command::cargo_bin("figmog")
-        .unwrap()
+    let out = common::command()
         .arg("status")
         .current_dir(dir.path())
         .assert()
@@ -1580,8 +1570,7 @@ fn socket_status_targets_the_current_mirror_with_zero_startup_files() {
     let resp = call(&mut stdin, &rx, 2, "figmog_files", json!({}));
     assert_eq!(result_json(&resp), json!([]));
 
-    let out = assert_cmd::Command::cargo_bin("figmog")
-        .unwrap()
+    let out = common::command()
         .arg("status")
         .current_dir(dir.path())
         .assert()
@@ -1703,8 +1692,7 @@ fn socket_routed_reads_are_byte_identical_to_direct_mode() {
     ];
 
     let run = |args: &[&str]| -> Value {
-        let out = assert_cmd::Command::cargo_bin("figmog")
-            .unwrap()
+        let out = common::command()
             .args(args)
             .current_dir(dir.path())
             .assert()

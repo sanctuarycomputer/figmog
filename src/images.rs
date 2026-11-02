@@ -53,7 +53,7 @@ pub const FILL: &str = "fill";
 /// (spec §5: "a repeat request on an unchanged file spends zero budget");
 /// every miss gets this exact per-item manifest error instead of a wasted
 /// (guaranteed-401) network attempt.
-const NO_TOKEN_MSG: &str = "FIGMA_TOKEN not set — required for image downloads";
+const NO_TOKEN_MSG: &str = "FIGMA_TOKEN is unset or empty and no saved token is available — required for image downloads; an empty FIGMA_TOKEN disables saved credentials, so unset it to use saved credentials; run `figmog auth login` or set FIGMA_TOKEN";
 
 /// Content blocks over roughly this many bytes are excluded from the MCP
 /// tool's inline content (spec §5's "1MB" cap) — 1 MiB exactly, matching
@@ -281,7 +281,7 @@ pub fn scan<R: Readable>(
 /// and return every item in `node_ids`' request order followed by the
 /// scanned fill refs' sorted order. `api: None` means "no Figma API token
 /// available": cache hits still resolve fully; every miss gets a
-/// `"FIGMA_TOKEN not set"` error instead of a network attempt.
+/// missing-credential error instead of a network attempt.
 #[allow(clippy::too_many_arguments)]
 pub fn resolve<P: Push<Keyed<Id, Rec>>>(
     st: &mut KeyedStream<Id, Rec, P>,
@@ -1284,6 +1284,11 @@ mod tests {
         assert_eq!(cached.bytes, vec![1, 1]);
         let miss = items.iter().find(|i| i.subject == "1:3").unwrap();
         assert_eq!(miss.error.as_deref(), Some(NO_TOKEN_MSG));
+        let message = miss.error.as_deref().unwrap();
+        assert!(message.contains("empty FIGMA_TOKEN disables saved credentials"));
+        assert!(message.contains("unset it to use saved credentials"));
+        assert!(message.contains("figmog auth login"));
+        assert!(message.contains("set FIGMA_TOKEN"));
         assert_eq!(*download_calls.borrow(), 0);
     }
 

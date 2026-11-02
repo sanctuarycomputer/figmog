@@ -59,6 +59,19 @@ pub(super) fn cmd_pull(
             message
         }
     })?;
+    if db.key.is_some() {
+        let ignored = std::env::current_dir()
+            .map_err(|error| error.to_string())
+            .and_then(|cwd| super::gitignore::ignore_local_mirror(&cwd));
+        if let Err(error) = ignored {
+            // Sync already succeeded. A read-only/invalid ignore file
+            // must not turn that into a failed pull or corrupt stdout.
+            eprintln!(
+                "{}",
+                serde_json::json!({"warning": format!("could not ignore .figmog/: {error}")})
+            );
+        }
+    }
     print_churn(&churn)
 }
 
@@ -98,8 +111,8 @@ pub(super) fn do_pull(
                 .clone()
                 .or_else(|| file.and_then(|f| parse_file_ref(&f)))
                 .ok_or_else(|| "no file key: pass a file key or figma.com URL".to_string())?;
-            let token = std::env::var("FIGMA_TOKEN")
-                .map_err(|_| "FIGMA_TOKEN not set — required for network pulls".to_string())?;
+            let token =
+                crate::auth::token()?.ok_or_else(|| crate::auth::missing_token("network pulls"))?;
             // Peek the mirror's stored geometry setting (spec §4) *before*
             // fetching, so a plain re-pull of a mirror that was ever
             // pulled with `--geometry` keeps asking for it. `--fresh`

@@ -27,13 +27,36 @@ $ xattr -d com.apple.quarantine ./figmog   # macOS only, see Install
 Tarballs live on the
 [releases page](https://github.com/sanctuarycomputer/figmog/releases).
 
-### 2. Set a Figma token
+### 2. Save a Figma token
 
 ```console
-$ export FIGMA_TOKEN=figd_…
+$ figmog auth login
 ```
 
-Make one at figma.com under settings, security, personal access tokens.
+Make one at figma.com under settings, security, personal access tokens,
+then paste it into the hidden prompt. figmog saves it in macOS Keychain
+or Linux Secret Service and reuses it across terminals, projects, and Git
+worktrees. Nothing is written to your project or mirror directory.
+
+```console
+$ figmog auth status       # credential source, never the token
+$ figmog auth logout       # remove the saved token
+```
+
+`FIGMA_TOKEN` still overrides the saved token for CI or another account.
+Unset it to use your saved credential; an explicitly empty `FIGMA_TOKEN`
+disables saved credentials for offline use. Logout removes only the saved
+credential, so an environment override remains active. Restart a running
+MCP server after changing credentials.
+
+For a password manager or other noninteractive secret source, pipe its
+output to `figmog auth login --token-stdin`. The token is never accepted
+as a command-line argument. Login stores the token without making a Figma
+request; `auth status` reports configuration, not whether Figma accepts it.
+Expired or revoked personal tokens must be replaced with `auth login`.
+On Linux, saved credentials require a running, unlocked Secret Service
+(such as GNOME Keyring or KWallet); headless environments can use
+`FIGMA_TOKEN` instead.
 
 ### 3. Connect it to Claude Code
 
@@ -76,6 +99,18 @@ The first `pull` writes the file key to `.figmog/current`, so later commands
 can drop the file argument. Read commands never touch the network and print
 JSON on stdout; failures print `{"error": ...}` on stderr and exit 1. Every
 command is documented in [`docs/SPEC.md`](docs/SPEC.md) §10.
+
+After a successful `pull` into the default `.figmog/` directory inside a
+Git repository, figmog adds `.figmog/` to the closest existing `.gitignore`
+between the current directory and the repository root, or creates the
+root `.gitignore` if none exists. Existing ignore rules are respected.
+Custom `--db` locations are left to you. A failure to update `.gitignore`
+prints a warning and keeps the successful pull result.
+
+Commit that ignore rule to keep mirrors out of future commits. Ignore
+rules do not untrack files already committed, and ignored files are not
+copied between worktrees: each worktree keeps its own mirror. Your saved
+credential is shared independently through the system credential store.
 
 ## figmog against the API
 

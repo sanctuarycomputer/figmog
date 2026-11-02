@@ -461,7 +461,7 @@ pub(crate) fn run_serve(
     no_socket: bool,
 ) -> Result<(), String> {
     let interval_dur = clamp_interval(interval);
-    let token = std::env::var("FIGMA_TOKEN").ok();
+    let token = crate::auth::token()?;
 
     // Bind the control-plane socket (spec §1) before anything else touches
     // the filesystem for this run: a stale-probe conflict ("another figmog
@@ -682,7 +682,7 @@ fn build_sessions(
                 .ok_or_else(|| "no file key: pass a file key or figma.com URL".to_string())?;
             token
                 .clone()
-                .ok_or_else(|| "FIGMA_TOKEN not set — required for watch".to_string())?;
+                .ok_or_else(|| crate::auth::missing_token("watch"))?;
         }
         let display_key = key_opt
             .clone()
@@ -723,7 +723,7 @@ fn build_sessions(
     if !no_watch && !files.is_empty() {
         token
             .clone()
-            .ok_or_else(|| "FIGMA_TOKEN not set — required for watch".to_string())?;
+            .ok_or_else(|| crate::auth::missing_token("watch"))?;
     }
 
     let mut manager = SessionManager {

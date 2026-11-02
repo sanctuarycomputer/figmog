@@ -2,8 +2,6 @@
 
 mod common;
 
-use assert_cmd::Command;
-
 /// Materialize fixture_v1 into a DB via `pull --from-file` and return the
 /// (tempdir, db-arg) pair every read command needs.
 fn fixture_db() -> (tempfile::TempDir, String) {
@@ -15,8 +13,7 @@ fn fixture_db() -> (tempfile::TempDir, String) {
     )
     .unwrap();
     let db = dir.path().join("db").display().to_string();
-    Command::cargo_bin("figmog")
-        .unwrap()
+    common::command()
         .args([
             "pull",
             "--from-file",
@@ -40,8 +37,7 @@ fn pull_from_file_reports_churn_and_is_idempotent() {
     .unwrap();
     let db = dir.path().join("db").display().to_string();
 
-    let out = Command::cargo_bin("figmog")
-        .unwrap()
+    let out = common::command()
         .args([
             "pull",
             "--from-file",
@@ -54,8 +50,7 @@ fn pull_from_file_reports_churn_and_is_idempotent() {
     let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
     assert_eq!(v["added"], 18);
 
-    let out = Command::cargo_bin("figmog")
-        .unwrap()
+    let out = common::command()
         .args([
             "pull",
             "--from-file",
@@ -90,8 +85,7 @@ fn pull_geometry_flag_keeps_fill_geometry_in_raw() {
     .unwrap();
     let db = dir.path().join("db").display().to_string();
 
-    Command::cargo_bin("figmog")
-        .unwrap()
+    common::command()
         .args([
             "pull",
             "--from-file",
@@ -103,8 +97,7 @@ fn pull_geometry_flag_keeps_fill_geometry_in_raw() {
         .assert()
         .success();
 
-    let out = Command::cargo_bin("figmog")
-        .unwrap()
+    let out = common::command()
         .args(["get", "1:1", "--db", &db])
         .assert()
         .success();
@@ -138,8 +131,7 @@ fn pull_geometry_flag_is_sticky_across_a_later_plain_pull() {
     let db_path = dir.path().join("db");
     let db = db_path.display().to_string();
 
-    Command::cargo_bin("figmog")
-        .unwrap()
+    common::command()
         .args([
             "pull",
             "--from-file",
@@ -156,8 +148,7 @@ fn pull_geometry_flag_is_sticky_across_a_later_plain_pull() {
         assert!(stored, "the --geometry pull must persist the flag");
     }
 
-    Command::cargo_bin("figmog")
-        .unwrap()
+    common::command()
         .args([
             "pull",
             "--from-file",
@@ -189,8 +180,7 @@ fn pull_fresh_turns_geometry_back_off() {
     let db_path = dir.path().join("db");
     let db = db_path.display().to_string();
 
-    Command::cargo_bin("figmog")
-        .unwrap()
+    common::command()
         .args([
             "pull",
             "--from-file",
@@ -202,8 +192,7 @@ fn pull_fresh_turns_geometry_back_off() {
         .assert()
         .success();
 
-    Command::cargo_bin("figmog")
-        .unwrap()
+    common::command()
         .args([
             "pull",
             "--from-file",
@@ -224,8 +213,7 @@ fn pull_fresh_turns_geometry_back_off() {
 fn status_pages_tree_get_find() {
     let (_dir, db) = fixture_db();
     let run = |args: &[&str]| {
-        let out = Command::cargo_bin("figmog")
-            .unwrap()
+        let out = common::command()
             .args(args)
             .args(["--db", &db])
             .assert()
@@ -268,8 +256,7 @@ fn status_pages_tree_get_find() {
 #[test]
 fn get_unknown_node_fails_cleanly() {
     let (_dir, db) = fixture_db();
-    Command::cargo_bin("figmog")
-        .unwrap()
+    common::command()
         .args(["get", "99:99", "--db", &db])
         .assert()
         .failure()
@@ -279,8 +266,7 @@ fn get_unknown_node_fails_cleanly() {
 #[test]
 fn get_unknown_node_error_is_json_on_stderr() {
     let (_dir, db) = fixture_db();
-    let out = Command::cargo_bin("figmog")
-        .unwrap()
+    let out = common::command()
         .args(["get", "99:99", "--db", &db])
         .assert()
         .failure()
@@ -299,8 +285,7 @@ fn get_unknown_node_error_is_json_on_stderr() {
 fn search_instances_components_styles_uses_vars() {
     let (_dir, db) = fixture_db();
     let run = |args: &[&str]| {
-        let out = Command::cargo_bin("figmog")
-            .unwrap()
+        let out = common::command()
             .args(args)
             .args(["--db", &db])
             .assert()
@@ -355,8 +340,7 @@ fn search_instances_components_styles_uses_vars() {
 fn stats_path_text_where_at() {
     let (_dir, db) = fixture_db();
     let run = |args: &[&str]| {
-        let out = Command::cargo_bin("figmog")
-            .unwrap()
+        let out = common::command()
             .args(args)
             .args(["--db", &db])
             .assert()
@@ -456,8 +440,7 @@ fn parent_cycle_does_not_hang_path_or_stats() {
 
     let db = db.display().to_string();
 
-    let out = Command::cargo_bin("figmog")
-        .unwrap()
+    let out = common::command()
         .args(["path", "A:1", "--db", &db])
         .assert()
         .failure()
@@ -465,8 +448,7 @@ fn parent_cycle_does_not_hang_path_or_stats() {
     let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
     assert!(stderr.contains("cycle"), "stderr: {stderr}");
 
-    Command::cargo_bin("figmog")
-        .unwrap()
+    common::command()
         .args(["stats", "--db", &db])
         .assert()
         .success();
@@ -511,8 +493,7 @@ fn children_cycle_does_not_hang_under_scoping() {
 
     let db = db.display().to_string();
 
-    let out = Command::cargo_bin("figmog")
-        .unwrap()
+    let out = common::command()
         .args(["find", "--type", "FRAME", "--under", "A:1", "--db", &db])
         .assert()
         .success();
@@ -536,14 +517,12 @@ fn import_variables_upgrades_vars_to_authoritative() {
     let export = dir.path().join("vars.json");
     std::fs::write(&export, include_str!("fixtures/variables-export.json")).unwrap();
 
-    Command::cargo_bin("figmog")
-        .unwrap()
+    common::command()
         .args(["import-variables", export.to_str().unwrap(), "--db", &db])
         .assert()
         .success();
 
-    let out = Command::cargo_bin("figmog")
-        .unwrap()
+    let out = common::command()
         .args(["vars", "--db", &db])
         .assert()
         .success();
@@ -572,8 +551,7 @@ fn import_variables_output_shape_is_the_variable_count_alone() {
     let export = dir.path().join("vars.json");
     std::fs::write(&export, include_str!("fixtures/variables-export.json")).unwrap();
 
-    let out = Command::cargo_bin("figmog")
-        .unwrap()
+    let out = common::command()
         .args(["import-variables", export.to_str().unwrap(), "--db", &db])
         .assert()
         .success();
@@ -588,8 +566,7 @@ fn import_variables_output_shape_is_the_variable_count_alone() {
 /// `figmog_images`), every one `source: "local"`.
 #[test]
 fn tools_output_shape_is_name_source_cacheable_rows() {
-    let out = Command::cargo_bin("figmog")
-        .unwrap()
+    let out = common::command()
         .args(["tools", "--no-upstream"])
         .assert()
         .success();
@@ -615,8 +592,7 @@ fn tools_output_shape_is_name_source_cacheable_rows() {
 #[test]
 fn tools_works_with_no_established_mirror() {
     let dir = tempfile::tempdir().unwrap();
-    Command::cargo_bin("figmog")
-        .unwrap()
+    common::command()
         .current_dir(dir.path())
         .args(["tools", "--no-upstream"])
         .assert()
@@ -634,10 +610,9 @@ fn failed_pull_does_not_persist_current_or_create_store() {
     // A well-formed-looking key (>=10 alnum chars) with no FIGMA_TOKEN set:
     // the network pull fails before ever touching the store or writing
     // `.figmog/current`.
-    Command::cargo_bin("figmog")
-        .unwrap()
+    common::command()
         .current_dir(dir.path())
-        .env_remove("FIGMA_TOKEN")
+        .env("FIGMA_TOKEN", "")
         .args(["pull", "garbagekey123456"])
         .assert()
         .failure()
@@ -650,8 +625,7 @@ fn failed_pull_does_not_persist_current_or_create_store() {
 
     // A subsequent read command still reports no mirror — not a stale or
     // bogus one — and doesn't leave behind an empty store dir either.
-    let out = Command::cargo_bin("figmog")
-        .unwrap()
+    let out = common::command()
         .current_dir(dir.path())
         .args(["status"])
         .assert()
@@ -676,9 +650,8 @@ fn call_figmog_sync_fails_cleanly_not_panicking() {
     // hold: a panic would print a backtrace banner and a different exit
     // status instead.
     let (_dir, db) = fixture_db();
-    let out = Command::cargo_bin("figmog")
-        .unwrap()
-        .env_remove("FIGMA_TOKEN")
+    let out = common::command()
+        .env("FIGMA_TOKEN", "")
         .args(["call", "figmog_sync", "--db", &db])
         .assert()
         .failure()
@@ -725,8 +698,7 @@ fn cli_pull_evicts_stale_cache_rows_on_version_change() {
         serde_json::to_string(&common::fixture_v1()).unwrap(),
     )
     .unwrap();
-    Command::cargo_bin("figmog")
-        .unwrap()
+    common::command()
         .args([
             "pull",
             "--from-file",
@@ -767,8 +739,7 @@ fn cli_pull_evicts_stale_cache_rows_on_version_change() {
         serde_json::to_string(&common::fixture_v2()).unwrap(),
     )
     .unwrap();
-    Command::cargo_bin("figmog")
-        .unwrap()
+    common::command()
         .args([
             "pull",
             "--from-file",
@@ -823,8 +794,7 @@ fn write_json_survives_a_reader_that_closes_mid_write() {
     std::fs::write(&response, serde_json::to_string(&doc).unwrap()).unwrap();
     let db = dir.path().join("db");
 
-    Command::cargo_bin("figmog")
-        .unwrap()
+    common::command()
         .args([
             "pull",
             "--from-file",
@@ -863,8 +833,7 @@ fn write_json_survives_a_reader_that_closes_mid_write() {
 #[test]
 fn json_flag_is_rejected_as_unknown() {
     let (_dir, db) = fixture_db();
-    let out = Command::cargo_bin("figmog")
-        .unwrap()
+    let out = common::command()
         .args(["status", "--db", &db, "--json"])
         .assert()
         .failure();
@@ -881,8 +850,7 @@ fn json_flag_is_rejected_as_unknown() {
 fn dump_full_raw_json_nested_recursively_with_depth_and_fields_projection() {
     let (_dir, db) = fixture_db();
     let run = |args: &[&str]| {
-        let out = Command::cargo_bin("figmog")
-            .unwrap()
+        let out = common::command()
             .args(args)
             .args(["--db", &db])
             .assert()
@@ -947,8 +915,7 @@ fn dump_full_raw_json_nested_recursively_with_depth_and_fields_projection() {
 #[test]
 fn dump_unknown_node_fails_cleanly() {
     let (_dir, db) = fixture_db();
-    let out = Command::cargo_bin("figmog")
-        .unwrap()
+    let out = common::command()
         .args(["dump", "99:99", "--db", &db])
         .assert()
         .failure()
@@ -963,8 +930,7 @@ fn dump_unknown_node_fails_cleanly() {
 fn under_scopes_find_text_search_where_and_intersects_with_page() {
     let (_dir, db) = fixture_db();
     let run = |args: &[&str]| {
-        let out = Command::cargo_bin("figmog")
-            .unwrap()
+        let out = common::command()
             .args(args)
             .args(["--db", &db])
             .assert()
@@ -1029,8 +995,7 @@ fn under_scopes_find_text_search_where_and_intersects_with_page() {
 #[test]
 fn under_unknown_id_errors_cleanly() {
     let (_dir, db) = fixture_db();
-    let out = Command::cargo_bin("figmog")
-        .unwrap()
+    let out = common::command()
         .args(["find", "--type", "TEXT", "--under", "99:99", "--db", &db])
         .assert()
         .failure()
@@ -1078,8 +1043,7 @@ fn search_under_ranks_the_full_corpus_before_truncating_to_limit() {
     });
     std::fs::write(&response, serde_json::to_string(&fixture).unwrap()).unwrap();
     let db = dir.path().join("db").display().to_string();
-    Command::cargo_bin("figmog")
-        .unwrap()
+    common::command()
         .args([
             "pull",
             "--from-file",
@@ -1091,8 +1055,7 @@ fn search_under_ranks_the_full_corpus_before_truncating_to_limit() {
         .success();
 
     let run = |args: &[&str]| {
-        let out = Command::cargo_bin("figmog")
-            .unwrap()
+        let out = common::command()
             .args(args)
             .args(["--db", &db])
             .assert()
@@ -1138,8 +1101,7 @@ fn resolve_vars_marks_bindings_unresolved_with_no_variables_table() {
 
     // No import: both of 1:1's bound variables (fill color, paddingLeft)
     // have no entry in the (empty) variables table.
-    let out = Command::cargo_bin("figmog")
-        .unwrap()
+    let out = common::command()
         .args(["get", "1:1", "--resolve-vars", "--db", &db])
         .assert()
         .success();
@@ -1163,15 +1125,13 @@ fn resolve_vars_resolves_imported_variables_on_get_dump_and_styles_values() {
     let (dir, db) = fixture_db();
     let export = dir.path().join("vars.json");
     std::fs::write(&export, include_str!("fixtures/variables-export.json")).unwrap();
-    Command::cargo_bin("figmog")
-        .unwrap()
+    common::command()
         .args(["import-variables", export.to_str().unwrap(), "--db", &db])
         .assert()
         .success();
 
     // `get --resolve-vars`: names + per-mode values from the imported table.
-    let out = Command::cargo_bin("figmog")
-        .unwrap()
+    let out = common::command()
         .args(["get", "1:1", "--resolve-vars", "--db", &db])
         .assert()
         .success();
@@ -1193,8 +1153,7 @@ fn resolve_vars_resolves_imported_variables_on_get_dump_and_styles_values() {
     assert_eq!(padding["values_by_mode"]["default"], 16.0);
 
     // `dump --resolve-vars`: same annotation, applied recursively.
-    let out = Command::cargo_bin("figmog")
-        .unwrap()
+    let out = common::command()
         .args(["dump", "1:1", "--resolve-vars", "--db", &db])
         .assert()
         .success();
@@ -1204,8 +1163,7 @@ fn resolve_vars_resolves_imported_variables_on_get_dump_and_styles_values() {
     // `styles --values --resolve-vars`: FILL style S:1's definition comes
     // from consumer 1:1, whose /fills/0/color binding is VariableID:100 —
     // paddingLeft (outside /fills) must not leak into this style's list.
-    let out = Command::cargo_bin("figmog")
-        .unwrap()
+    let out = common::command()
         .args(["styles", "--values", "--resolve-vars", "--db", &db])
         .assert()
         .success();
@@ -1229,15 +1187,13 @@ fn get_dump_and_path_accept_a_full_figma_url_as_the_node_id() {
     let (_dir, db) = fixture_db();
     let url = "https://www.figma.com/design/flAtUnMfzvA5daBSTFQK35/Fixture?node-id=1-1&t=abc-1";
 
-    let bare = Command::cargo_bin("figmog")
-        .unwrap()
+    let bare = common::command()
         .args(["get", "1:1", "--db", &db])
         .assert()
         .success();
     let bare: serde_json::Value = serde_json::from_slice(&bare.get_output().stdout).unwrap();
 
-    let via_url = Command::cargo_bin("figmog")
-        .unwrap()
+    let via_url = common::command()
         .args(["get", url, "--db", &db])
         .assert()
         .success();
@@ -1247,8 +1203,7 @@ fn get_dump_and_path_accept_a_full_figma_url_as_the_node_id() {
         "a frame URL resolves to the same node as its bare id"
     );
 
-    let dump_via_url = Command::cargo_bin("figmog")
-        .unwrap()
+    let dump_via_url = common::command()
         .args(["dump", url, "--depth", "0", "--db", &db])
         .assert()
         .success();
@@ -1256,8 +1211,7 @@ fn get_dump_and_path_accept_a_full_figma_url_as_the_node_id() {
         serde_json::from_slice(&dump_via_url.get_output().stdout).unwrap();
     assert_eq!(dump_via_url["id"], "1:1");
 
-    let path_via_url = Command::cargo_bin("figmog")
-        .unwrap()
+    let path_via_url = common::command()
         .args(["path", url, "--db", &db])
         .assert()
         .success();
@@ -1279,8 +1233,7 @@ fn get_dump_and_path_accept_a_full_figma_url_as_the_node_id() {
 fn page_argument_accepts_a_full_figma_url() {
     let (_dir, db) = fixture_db();
     let run = |args: &[&str]| {
-        let out = Command::cargo_bin("figmog")
-            .unwrap()
+        let out = common::command()
             .args(args)
             .args(["--db", &db])
             .assert()
@@ -1324,8 +1277,7 @@ fn images_no_token_error_path_is_manifest_shaped_json_exit_1() {
     )
     .unwrap();
 
-    Command::cargo_bin("figmog")
-        .unwrap()
+    common::command()
         .current_dir(dir.path())
         .args([
             "pull",
@@ -1336,10 +1288,9 @@ fn images_no_token_error_path_is_manifest_shaped_json_exit_1() {
         .assert()
         .success();
 
-    let out = Command::cargo_bin("figmog")
-        .unwrap()
+    let out = common::command()
         .current_dir(dir.path())
-        .env_remove("FIGMA_TOKEN")
+        .env("FIGMA_TOKEN", "")
         .args(["images", "1:2", "--no-socket"])
         .assert()
         .failure()
@@ -1373,8 +1324,7 @@ fn images_no_token_error_path_is_manifest_shaped_json_exit_1() {
 #[test]
 fn images_with_no_established_mirror_fails_like_every_other_command() {
     let dir = tempfile::tempdir().unwrap();
-    let out = Command::cargo_bin("figmog")
-        .unwrap()
+    let out = common::command()
         .current_dir(dir.path())
         .args(["images", "1:2"])
         .assert()
@@ -1390,11 +1340,7 @@ fn images_with_no_established_mirror_fails_like_every_other_command() {
 /// enough to open a store or hit the network.
 #[test]
 fn images_with_no_ids_is_rejected_by_clap() {
-    let out = Command::cargo_bin("figmog")
-        .unwrap()
-        .args(["images"])
-        .assert()
-        .failure();
+    let out = common::command().args(["images"]).assert().failure();
     let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
     assert!(
         stderr.to_lowercase().contains("required")
