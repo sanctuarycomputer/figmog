@@ -25,7 +25,7 @@ $ xattr -d com.apple.quarantine ./figmog   # macOS only, see Install
 ```
 
 Tarballs live on the
-[releases page](https://github.com/sanctuarycomputer/figmog/releases).
+[releases page](https://github.com/net-work-studio/figmog/releases).
 
 ### 2. Save a Figma token
 
@@ -235,7 +235,7 @@ lives in the repo history: `docs/history/2026-08-16-figmog-bench.md`.
 ## Install
 
 Download `figmog-<version>-<target>.tar.gz` and `SHA256SUMS` from
-[Releases](https://github.com/sanctuarycomputer/figmog/releases). Targets:
+[Releases](https://github.com/net-work-studio/figmog/releases). Targets:
 `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`.
 
 ```console
@@ -253,7 +253,7 @@ on Ubuntu 24.04 and needs glibc 2.39 or newer; on an older distribution,
 build from source:
 
 ```console
-$ git clone https://github.com/sanctuarycomputer/figmog.git
+$ git clone https://github.com/net-work-studio/figmog.git
 $ cd figmog && cargo build --release
 ```
 
