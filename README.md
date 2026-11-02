@@ -260,6 +260,13 @@ $ cd figmog && cargo build --release
 That needs a Rust toolchain and network access, since the build fetches
 `fold` from its pinned git rev.
 
+For maintainers: pushing a `v*` tag starts the Release workflow. To release
+an existing tag whose original workflow never ran, open Actions → Release →
+Run workflow, select `main`, and enter the tag (for example, `v0.0.3`). The
+workflow builds the tag's commit and publishes the three tarballs and
+`SHA256SUMS` as a GitHub pre-release. The tag must already exist; this does
+not create or move it. No custom repository secrets are required.
+
 ## Limitations
 
 - Full per-mode variable values need either an Enterprise plan or a manual

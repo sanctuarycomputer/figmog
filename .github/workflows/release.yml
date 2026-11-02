@@ -3,17 +3,53 @@ name: Release
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to build (for example, v0.0.3)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      commit: ${{ steps.release.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve existing release tag
+        id: release
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          if [[ "$RELEASE_TAG" != v* || "$RELEASE_TAG" == */* ]] || ! git check-ref-format "refs/tags/$RELEASE_TAG"; then
+            echo '::error::Release tag must be a valid single-component tag starting with v.'
+            exit 1
+          fi
+          git fetch --no-tags origin "refs/tags/$RELEASE_TAG"
+          commit=$(git rev-parse 'FETCH_HEAD^{commit}')
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: resolve
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: aarch64-apple-darwin
-            runner: macos-14
+            runner: macos-15
           - target: x86_64-apple-darwin
-            runner: macos-14
+            runner: macos-15
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
     runs-on: ${{ matrix.runner }}
@@ -21,6 +57,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
 
       - name: Install stable Rust with target
         run: |
@@ -34,23 +72,27 @@ jobs:
         run: strip target/${{ matrix.target }}/release/figmog
 
       - name: Package tarball
+        env:
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
         run: |
-          tar czf "figmog-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz" \
+          tar czf "figmog-${RELEASE_TAG}-${{ matrix.target }}.tar.gz" \
             -C target/${{ matrix.target }}/release figmog
 
       - uses: actions/upload-artifact@v4
         with:
           name: figmog-${{ matrix.target }}
-          path: "figmog-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"
+          path: "figmog-${{ needs.resolve.outputs.tag }}-${{ matrix.target }}.tar.gz"
           if-no-files-found: error
 
   publish:
-    needs: build
+    needs: [resolve, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
 
       - uses: actions/download-artifact@v4
         with:
@@ -65,9 +107,11 @@ jobs:
         working-directory: dist
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
+          gh release create "$RELEASE_TAG" \
+            --verify-tag \
             --prerelease \
-            --title "$GITHUB_REF_NAME" \
+            --title "$RELEASE_TAG" \
             --notes "Pre-release binaries for testing. See the README's Install section for platform tarballs, the SHA256SUMS verification snippet, and the macOS quarantine note. figmog depends on fold via a pinned git rev; upstream bogkit currently ships with no license file, so broader redistribution beyond this repo's own testing releases is deferred until that clears (see README's License section)." \
             *.tar.gz SHA256SUMS
